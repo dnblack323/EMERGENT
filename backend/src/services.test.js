@@ -1,0 +1,4867 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createCipheriv, createHash, pbkdf2Sync, randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
+import { migratedMemoryDatabase, openDatabase, runMigrations } from "./db.js";
+import { SlimService } from "./services.js";
+import { decryptBackup } from "./backup.js";
+import { createSlimServer, readMultipartFile } from "./server.js";
+import { documentTotals, lineTotalCents, paymentStatus } from "./money.js";
+import { resetTimestampClockForTests } from "./timestamps.js";
+import { hashToken } from "./security.js";
+import { defaultTenantStorageQuotaBytes, rateLimitPolicy } from "./accountControls.js";
+import { validateProductionConfig } from "./config.js";
+
+let db;
+let service;
+let owner;
+let token;
+let attachmentRoot;
+
+function clearTestEnvironment() {
+  delete process.env.SIGNGUY_SLIM_ATTACHMENT_ROOT;
+  delete process.env.SIGNGUY_SLIM_UPLOAD_LIMIT_BYTES;
+  delete process.env.SIGNGUY_SLIM_DB_PATH;
+  delete process.env.SIGNGUY_SLIM_SERVER_BACKUP_ROOT;
+  delete process.env.SIGNGUY_SLIM_ALLOWED_ORIGINS;
+  delete process.env.SIGNGUY_SLIM_COOKIE_SECURE;
+  delete process.env.SIGNGUY_SLIM_DEFAULT_TENANT_STORAGE_QUOTA_BYTES;
+  delete process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+  delete process.env.SIGNGUY_SLIM_APP_URL;
+  delete process.env.SIGNGUY_SLIM_RECOVERY_FROM_EMAIL;
+  delete process.env.SIGNGUY_SLIM_PASSWORD_RESET_LIFETIME_SECONDS;
+  delete process.env.SIGNGUY_SLIM_PASSWORD_RESET_REQUEST_MAX_MATCHES;
+  delete process.env.SIGNGUY_SLIM_SIGNUP_INVITATION_LIFETIME_SECONDS;
+  delete process.env.SIGNGUY_SLIM_TRUST_PROXY;
+  delete process.env.SIGNGUY_SLIM_TRUST_PROXY_HOPS;
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith("SIGNGUY_SLIM_RATE_LIMIT_")) delete process.env[key];
+  }
+}
+
+const address = {
+  line1: "10 Main St",
+  line2: null,
+  city: "Austin",
+  state: "TX",
+  postal_code: "78701",
+  country: "US",
+};
+
+async function bootstrap(slug = "shop-a", tax = 825) {
+  const session = await service.registerTenant({
+    tenant_name: slug,
+    tenant_slug: slug,
+    owner_name: "Owner",
+    owner_email: `${slug}@example.com`,
+    owner_password: "password123",
+    sales_tax_rate_basis_points: tax,
+  });
+  return session;
+}
+
+function customer(actor, overrides = {}) {
+  return service.createCustomer(actor, {
+    contact_name: "Jane Customer",
+    business_name: "Jane Co",
+    email: "jane@example.com",
+    phone: "555-0100",
+    billing_address: address,
+    ...overrides,
+  });
+}
+
+function item(overrides = {}) {
+  return {
+    title: "Banner",
+    description: "Banner",
+    quantity_decimal: "2.5000",
+    unit_price_cents: 1200,
+    taxable: true,
+    production_required: true,
+    ...overrides,
+  };
+}
+
+function tinyPng() {
+  return Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=", "base64");
+}
+
+function backupFile(backup, name = "backup.signguy-backup") {
+  const dir = mkdtempSync(join(tmpdir(), "signguy-slim-backup-test-"));
+  const tempPath = join(dir, name);
+  writeFileSync(tempPath, backup.buffer);
+  return { filename: name, mime_type: "application/vnd.signguy.backup", temp_path: tempPath, byte_size: backup.buffer.length, cleanup_dir: dir };
+}
+
+function sha256Buffer(buffer) {
+  return createHash("sha256").update(buffer).digest("hex");
+}
+
+function dataFile(path, value) {
+  const bytes = Buffer.from(JSON.stringify(value), "utf8");
+  return { path, media_type: "application/json", size_bytes: bytes.length, sha256: sha256Buffer(bytes) };
+}
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function refreshManifest(payload) {
+  const sections = ["tenants", "users", "customers", "estimates", "estimate_items", "orders", "order_items", "work_orders", "work_order_items", "invoices", "expenses", "commercial_bundles", "commercial_bundle_items", "calendar_events", "employees", "employee_rates", "employee_time_entries", "employee_pay_weeks", "employee_pay_advances", "employee_pay_adjustments", "employee_pay_manual_payments", "employee_announcements", "employee_announcement_reads", "employee_direct_messages", "tenant_sequences", "reminders", "notes", "audit_events"];
+  for (const section of sections) if (!payload.data[section]) payload.data[section] = [];
+  payload.manifest.record_counts = Object.fromEntries(sections.map((section) => [section, payload.data[section].length]));
+  payload.manifest.record_counts.attachments = payload.attachments.length;
+  payload.manifest.data_file_inventory = sections.map((section) => dataFile(`data/${section}.json`, payload.data[section]));
+  payload.manifest.attachment_inventory = payload.attachments.map((entry) => {
+    const bytes = Buffer.from(entry.content_base64, "base64");
+    return {
+      path: entry.logical_path,
+      content_type: entry.metadata.mime_type,
+      size_bytes: bytes.length,
+      sha256: sha256Buffer(bytes),
+      source_portable_id: entry.metadata.portable_id,
+    };
+  });
+  payload.manifest.attachment_count = payload.attachments.length;
+  payload.manifest.total_attachment_bytes = payload.attachments.reduce((sum, entry) => sum + Buffer.from(entry.content_base64, "base64").length, 0);
+  payload.manifest.overall_backup_integrity = `sha256:${sha256Buffer(Buffer.from(JSON.stringify({ data: payload.data, attachments: payload.manifest.attachment_inventory }), "utf8"))}`;
+  return payload;
+}
+
+function removeStep3ExpenseBackupSections(payload) {
+  for (const section of ["expenses", "commercial_bundles", "commercial_bundle_items"]) {
+    delete payload.data[section];
+    delete payload.manifest.record_counts[section];
+  }
+  payload.attachments = payload.attachments.filter((entry) => entry.metadata.owner_type !== "expense");
+  payload.manifest.attachment_inventory = payload.manifest.attachment_inventory.filter((entry) => !entry.path.startsWith("expense-attachments/"));
+  payload.manifest.record_counts.attachments = payload.attachments.length;
+  payload.manifest.attachment_count = payload.attachments.length;
+  payload.manifest.total_attachment_bytes = payload.attachments.reduce((sum, entry) => sum + Buffer.from(entry.content_base64, "base64").length, 0);
+}
+
+function refreshStageSixManifest(payload) {
+  removeStep3ExpenseBackupSections(payload);
+  for (const section of ["work_orders", "work_order_items", "employee_announcements", "employee_announcement_reads", "employee_direct_messages"]) {
+    delete payload.data[section];
+    delete payload.manifest.record_counts[section];
+  }
+  payload.manifest.source_schema_version = "012_v2_stage5_6_time_pay.sql";
+  payload.manifest.data_file_inventory = payload.manifest.data_file_inventory.filter((entry) => ![
+    "data/employee_announcements.json",
+    "data/employee_announcement_reads.json",
+    "data/employee_direct_messages.json",
+    "data/work_orders.json",
+    "data/work_order_items.json",
+    "data/expenses.json",
+  ].includes(entry.path));
+  payload.manifest.overall_backup_integrity = `sha256:${sha256Buffer(Buffer.from(JSON.stringify({ data: payload.data, attachments: payload.manifest.attachment_inventory }), "utf8"))}`;
+  return payload;
+}
+
+function refreshStageEightManifest(payload) {
+  removeStep3ExpenseBackupSections(payload);
+  for (const section of ["work_orders", "work_order_items"]) {
+    delete payload.data[section];
+    delete payload.manifest.record_counts[section];
+  }
+  payload.manifest.source_schema_version = "013_v2_stage7_8_messages_announcements.sql";
+  payload.manifest.data_file_inventory = payload.manifest.data_file_inventory.filter((entry) => ![
+    "data/work_orders.json",
+    "data/work_order_items.json",
+    "data/expenses.json",
+  ].includes(entry.path));
+  payload.manifest.overall_backup_integrity = `sha256:${sha256Buffer(Buffer.from(JSON.stringify({ data: payload.data, attachments: payload.manifest.attachment_inventory }), "utf8"))}`;
+  return payload;
+}
+
+function migrationUpSql(text) {
+  return text.split("-- migrate:down")[0].replace("-- migrate:up", "").trim();
+}
+
+function runMigrationsThrough(db, stopFile) {
+  const migrationDir = join(process.cwd(), "backend", "migrations");
+  const files = readdirSync(migrationDir).filter((file) => file.endsWith(".sql")).sort().filter((file) => file <= stopFile);
+  db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+  for (const file of files) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec(migrationUpSql(readFileSync(join(migrationDir, file), "utf8")));
+      db.prepare("INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)").run(file, new Date().toISOString());
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+}
+
+function addDays(dateString, days) {
+  const date = new Date(`${dateString}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function encryptedPayload(payload, passphrase = "long-passphrase-4") {
+  const salt = randomBytes(16);
+  const nonce = randomBytes(12);
+  const aad = { signature: "SIGNGUY-SLIM-BACKUP", container_version: "1.0.0", algorithm: "AES-256-GCM", kdf: "PBKDF2-HMAC-SHA256", kdf_iterations: 310000 };
+  const cipher = createCipheriv("aes-256-gcm", pbkdf2Sync(passphrase, salt, 310000, 32, "sha256"), nonce);
+  cipher.setAAD(Buffer.from(JSON.stringify(aad), "utf8"));
+  const ciphertext = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(payload), "utf8")), cipher.final()]);
+  return {
+    buffer: Buffer.from(JSON.stringify({
+      ...aad,
+      salt_b64: salt.toString("base64"),
+      nonce_b64: nonce.toString("base64"),
+      tag_b64: cipher.getAuthTag().toString("base64"),
+      ciphertext_b64: ciphertext.toString("base64"),
+    }), "utf8"),
+  };
+}
+
+function annotationOps(overrides = {}) {
+  return [{
+    id: "op-1",
+    type: "rectangle",
+    color: "#d92d20",
+    stroke_width: 4,
+    start: { x: 0.1, y: 0.1 },
+    end: { x: 0.8, y: 0.8 },
+    ...overrides,
+  }];
+}
+
+function countFiles(path) {
+  if (!existsSync(path)) return 0;
+  return readdirSync(path, { withFileTypes: true }).reduce((total, entry) => {
+    const full = join(path, entry.name);
+    return total + (entry.isDirectory() ? countFiles(full) : 1);
+  }, 0);
+}
+
+function tempUploadDirs(path) {
+  return existsSync(path) ? readdirSync(path).filter((name) => name.startsWith("signguy-slim-upload-")) : [];
+}
+
+function multipartRequest(body, { boundary = "test-boundary", headers = {} } = {}) {
+  const req = new PassThrough();
+  req.headers = { "content-type": `multipart/form-data; boundary=${boundary}`, ...headers };
+  queueMicrotask(() => req.end(body));
+  return req;
+}
+
+function multipartBody(content = "proof", { boundary = "test-boundary", filename = "proof.txt", mime = "text/plain" } = {}) {
+  return Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${mime}\r\n\r\n${content}\r\n--${boundary}--\r\n`);
+}
+
+function withTimeout(promise) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("promise_timeout")), 1000)),
+  ]);
+}
+
+function cookiePair(response) {
+  const header = response.headers.getSetCookie?.()[0] || response.headers.get("set-cookie") || "";
+  return header.split(";")[0];
+}
+
+function cookieValue(cookie) {
+  return String(cookie || "").split("=").slice(1).join("=");
+}
+
+async function registerHttpSession(base, payload, headers = {}) {
+  const response = await fetch(`${base}/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(payload),
+  });
+  return { response, session: await response.json(), cookie: cookiePair(response) };
+}
+
+async function loginHttpSession(base, payload, headers = {}) {
+  const response = await fetch(`${base}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(payload),
+  });
+  return { response, session: await response.json(), cookie: cookiePair(response) };
+}
+
+function authHeaders(auth, json = true) {
+  return {
+    ...(json ? { "Content-Type": "application/json" } : {}),
+    Cookie: auth.cookie,
+    "X-CSRF-Token": auth.session.csrf_token,
+  };
+}
+
+beforeEach(async () => {
+  clearTestEnvironment();
+  attachmentRoot = mkdtempSync(join(tmpdir(), "signguy-slim-test-"));
+  process.env.SIGNGUY_SLIM_ATTACHMENT_ROOT = attachmentRoot;
+  db = migratedMemoryDatabase();
+  service = new SlimService(db);
+  const session = await bootstrap();
+  token = service.issueSessionEnvelope(session.user).token;
+  owner = session.user;
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  resetTimestampClockForTests();
+  if (attachmentRoot) rmSync(attachmentRoot, { recursive: true, force: true });
+  clearTestEnvironment();
+});
+
+describe("authentication and tenant boundaries", () => {
+  it("hashes passwords and issues database-backed cookie sessions without serializing the session token", async () => {
+    const row = db.prepare("SELECT password_hash FROM users WHERE id = ?").get(owner.id);
+    expect(row.password_hash).not.toContain("password123");
+    const publicLogin = await service.login({ tenant_slug: "shop-a", email: "shop-a@example.com", password: "password123" });
+    expect(publicLogin.access_token).toBeUndefined();
+    expect(publicLogin.token_type).toBeUndefined();
+    expect(publicLogin.session_token).toBeUndefined();
+    expect(publicLogin.session_expires_at).toBeUndefined();
+    expect(publicLogin.csrf_token).toBeTruthy();
+    const login = await service.login({ tenant_slug: "shop-a", email: "shop-a@example.com", password: "password123" }, { includeSessionCredential: true });
+    expect(login.token).toBeTruthy();
+    expect(login.expires_at).toBeTruthy();
+    expect(login.payload).toBeTruthy();
+    expect(login.access_token).toBeUndefined();
+    expect(login.token_type).toBeUndefined();
+    expect(login.payload.session_token).toBeUndefined();
+    expect(JSON.stringify(login.payload)).not.toContain(login.token);
+    expect(login.payload.csrf_token).toBeTruthy();
+    const storedSession = db.prepare("SELECT token_hash FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1").get(owner.id);
+    expect(storedSession.token_hash).not.toBe(token);
+    expect(storedSession.token_hash).toHaveLength(64);
+    expect(login.payload.capabilities).toMatchObject({
+      can_manage_commercial: true,
+      can_send_customer_email: true,
+      can_manage_production: true,
+      can_perform_production_work: true,
+      can_manage_calendar: true,
+      can_manage_settings: true,
+      can_manage_backup: true,
+      can_manage_account_security: true,
+      can_manage_employees: true,
+      can_review_time: true,
+      can_manage_pay: true,
+      can_use_employee_portal: false,
+      can_manage_announcements: true,
+    });
+    const actor = service.actorForToken(token);
+    expect(actor.id).toBe(owner.id);
+    expect(service.verifyCsrf(actor, service.sessionPayload(actor).csrf_token)).toBe(true);
+    expect(service.verifyCsrf(actor, "bad-csrf")).toBe(false);
+  });
+
+  it("rejects expired sessions", () => {
+    db.prepare("UPDATE sessions SET expires_at = ? WHERE user_id = ?").run("2000-01-01T00:00:00.000Z", owner.id);
+    expect(() => service.actorForToken(token)).toThrow("unauthorized");
+  });
+
+  it("derives session capabilities from backend permission and employee-portal rules", async () => {
+    const manager = await service.addUser(owner, {
+      display_name: "Manager",
+      email: "manager-capabilities@example.com",
+      password: "password123",
+      role: "manager",
+    });
+    const staff = await service.addUser(owner, {
+      display_name: "Staff",
+      email: "staff-capabilities@example.com",
+      password: "password123",
+      role: "staff",
+    });
+
+    expect(service.sessionPayload(manager).capabilities).toMatchObject({
+      can_manage_commercial: true,
+      can_send_customer_email: true,
+      can_manage_production: true,
+      can_perform_production_work: true,
+      can_manage_calendar: true,
+      can_manage_settings: false,
+      can_manage_backup: false,
+      can_manage_account_security: false,
+      can_manage_employees: true,
+      can_review_time: true,
+      can_manage_pay: false,
+      can_use_employee_portal: false,
+      can_manage_announcements: false,
+    });
+    expect(service.sessionPayload(staff).capabilities).toMatchObject({
+      can_manage_commercial: false,
+      can_send_customer_email: false,
+      can_manage_production: false,
+      can_perform_production_work: true,
+      can_manage_calendar: false,
+      can_manage_settings: false,
+      can_manage_backup: false,
+      can_manage_account_security: false,
+      can_manage_employees: false,
+      can_review_time: false,
+      can_manage_pay: false,
+      can_use_employee_portal: false,
+      can_manage_announcements: false,
+    });
+
+    const managerEmployee = service.createEmployee(owner, {
+      user_id: manager.id,
+      name: "Manager",
+      email: manager.email,
+      role: "manager",
+      portal_access_enabled: true,
+      hourly_rate_cents: 2500,
+      rate_effective_date: "2026-08-15",
+    });
+    service.createEmployee(owner, {
+      user_id: staff.id,
+      name: "Staff",
+      email: staff.email,
+      role: "staff",
+      portal_access_enabled: true,
+      hourly_rate_cents: 1500,
+      rate_effective_date: "2026-08-15",
+    });
+
+    expect(service.sessionPayload(staff).capabilities.can_use_employee_portal).toBe(true);
+    service.updateEmployee(owner, managerEmployee.id, { pay_management_enabled: true });
+    expect(service.sessionPayload(manager).capabilities).toMatchObject({
+      can_manage_pay: true,
+      can_use_employee_portal: true,
+    });
+  });
+
+  it("recomputes session capabilities from current records during token refresh", async () => {
+    const manager = await service.addUser(owner, {
+      display_name: "Refresh Manager",
+      email: "refresh-manager@example.com",
+      password: "password123",
+      role: "manager",
+    });
+    const employee = service.createEmployee(owner, {
+      user_id: manager.id,
+      name: "Refresh Manager",
+      email: manager.email,
+      role: "manager",
+      portal_access_enabled: true,
+      pay_management_enabled: true,
+      hourly_rate_cents: 2500,
+      rate_effective_date: "2026-08-15",
+    });
+    const login = await service.login({ tenant_slug: "shop-a", email: manager.email, password: "password123" }, { includeSessionCredential: true });
+
+    expect(login.payload.capabilities).toMatchObject({
+      can_manage_commercial: true,
+      can_send_customer_email: true,
+      can_manage_production: true,
+      can_perform_production_work: true,
+      can_manage_calendar: true,
+      can_manage_employees: true,
+      can_review_time: true,
+      can_manage_pay: true,
+      can_use_employee_portal: true,
+    });
+
+    service.updateEmployee(owner, employee.id, { pay_management_enabled: false });
+    expect(service.sessionPayload(service.actorForToken(login.token)).capabilities).toMatchObject({
+      can_manage_pay: false,
+      can_use_employee_portal: true,
+    });
+
+    service.updateEmployee(owner, employee.id, { portal_access_enabled: false });
+    service.updateUser(owner, manager.id, { role: "staff" });
+    expect(service.sessionPayload(service.actorForToken(login.token)).capabilities).toMatchObject({
+      can_manage_commercial: false,
+      can_send_customer_email: false,
+      can_manage_production: false,
+      can_perform_production_work: true,
+      can_manage_calendar: false,
+      can_manage_employees: false,
+      can_review_time: false,
+      can_manage_pay: false,
+      can_use_employee_portal: false,
+      can_manage_announcements: false,
+    });
+  });
+
+  it("rejects same-tenant relationship violations", async () => {
+    const other = await bootstrap("shop-b");
+    const otherCustomer = customer(other.user);
+    expect(() => service.createEstimate(owner, { title: "Test Order", customer_id: otherCustomer.id, items: [item()] })).toThrow("customer_not_found");
+  });
+
+  it("enforces role permissions for settings and manual payment recording", async () => {
+    const staff = await service.addUser(owner, {
+      display_name: "Staff",
+      email: "staff@example.com",
+      password: "password123",
+      role: "staff",
+    });
+    expect(() => service.updateSettings(staff, { company_name: "Nope" })).toThrow("permission_denied");
+    const manager = service.updateUser(owner, staff.id, { role: "manager" });
+    expect(manager.role).toBe("manager");
+    const settings = service.updateSettings(owner, { dashboard_widgets: { important_week: false, messages: false } });
+    expect(settings.tenant.dashboard_widgets).toMatchObject({ important_week: false, messages: false, clocked_in: true });
+    expect(service.dashboard(owner).widgets).toMatchObject({ important_week: false, messages: false, clocked_in: true });
+  });
+
+  it("restricts commercial mutations to owner, admin, and manager roles while preserving staff operational work", async () => {
+    const manager = await service.addUser(owner, {
+      display_name: "Commercial Manager",
+      email: "commercial-manager@example.com",
+      password: "password123",
+      role: "manager",
+    });
+    const staff = await service.addUser(owner, {
+      display_name: "Commercial Staff",
+      email: "commercial-staff@example.com",
+      password: "password123",
+      role: "staff",
+    });
+    const unassignedStaff = await service.addUser(owner, {
+      display_name: "Unassigned Staff",
+      email: "unassigned-commercial-staff@example.com",
+      password: "password123",
+      role: "staff",
+    });
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, { title: "Commercial Quote", customer_id: c.id, items: [item({ assigned_user_id: staff.id })] });
+    const order = service.convertEstimate(owner, estimate.id).order;
+    const invoice = service.createOrOpenInvoice(owner, order.id).invoice;
+
+    expect(() => service.listCustomers(staff)).toThrow("permission_denied");
+    expect(() => service.customer(staff, c.id)).toThrow("permission_denied");
+    expect(() => service.createCustomer(staff, { contact_name: "Nope", billing_address: address })).toThrow("permission_denied");
+    expect(() => service.updateCustomer(staff, c.id, { business_name: "Nope" })).toThrow("permission_denied");
+    expect(() => service.listEstimates(staff)).toThrow("permission_denied");
+    expect(() => service.estimate(staff, estimate.id)).toThrow("permission_denied");
+    expect(() => service.createEstimate(staff, { title: "Nope", customer_id: c.id, items: [item()] })).toThrow("permission_denied");
+    expect(() => service.updateEstimate(staff, estimate.id, { title: "Nope" })).toThrow("permission_denied");
+    expect(() => service.duplicateEstimate(staff, estimate.id)).toThrow("permission_denied");
+    expect(() => service.convertEstimate(staff, estimate.id)).toThrow("permission_denied");
+    expect(() => service.listOrders(staff)).toThrow("permission_denied");
+    expect(() => service.createOrder(staff, { title: "Nope", customer_id: c.id, items: [item()] })).toThrow("permission_denied");
+    expect(() => service.updateOrderWorkspace(staff, order.id, { ...order, expected_updated_at: order.updated_at, items: order.items })).toThrow("permission_denied");
+    expect(() => service.updateOrderStatus(staff, order.id, "on_hold")).toThrow("permission_denied");
+    expect(() => service.setProductionStage(staff, order.items[0].id, "in_progress")).toThrow("permission_denied");
+    expect(() => service.setItemCompletion(staff, order.items[0].id, true)).toThrow("permission_denied");
+    expect(() => service.saveCommercialBundles(staff, "order", order.id, { bundles: [] })).toThrow("permission_denied");
+    expect(() => service.listCommercialBundles(staff, "estimate", estimate.id)).toThrow("permission_denied");
+    expect(() => service.listInvoices(staff)).toThrow("permission_denied");
+    expect(() => service.invoice(staff, invoice.id)).toThrow("permission_denied");
+    expect(() => service.createOrOpenInvoice(staff, order.id)).toThrow("permission_denied");
+    expect(() => service.setInvoiceDocumentStatus(staff, invoice.id, "issued")).toThrow("permission_denied");
+    expect(() => service.recordInvoicePayment(staff, invoice.id, { amount_paid_cents: 100 })).toThrow("permission_denied");
+    expect(() => service.auditTrail(staff, "invoice", invoice.id)).toThrow("permission_denied");
+    expect(() => service.listCommunications(staff)).toThrow("permission_denied");
+    expect(() => service.createManualCommunication(staff, { customer_id: c.id, channel: "phone", direction: "inbound", subject: "Nope", body_text: "Nope" })).toThrow("permission_denied");
+    await expect(service.sendCustomerEmail(staff, "order", order.id, { subject: "Nope", body_text: "Nope", attach_document: false })).rejects.toThrow("permission_denied");
+    expect(() => service.createCalendarEvent(staff, {
+      title: "Customer appointment",
+      entry_type: "appointment",
+      schedule_category: "customer_appointment",
+      order_id: order.id,
+      start_at: "2026-08-21T09:00",
+      end_at: "2026-08-21T10:00",
+    })).toThrow("permission_denied");
+    expect(() => service.listIntakeItems(staff)).toThrow("permission_denied");
+    expect(() => service.createBackup(staff, { passphrase: "long-passphrase", passphrase_confirmation: "long-passphrase" })).toThrow("permission_denied");
+    await expect(service.createUserPasswordReset(staff, manager.id, { send_email: false })).rejects.toThrow("permission_denied");
+
+    expect(service.createCustomer(manager, { contact_name: "Manager Customer", billing_address: address }).contact_name).toBe("Manager Customer");
+    expect(service.updateOrderStatus(manager, order.id, "active").status).toBe("active");
+    expect(service.setInvoiceDocumentStatus(manager, invoice.id, "issued").document_status).toBe("issued");
+    expect(service.auditTrail(manager, "invoice", invoice.id).some((entry) => entry.action === "invoice.document_status")).toBe(true);
+    expect(() => service.updateSettings(manager, { company_name: "Manager Settings" })).toThrow("permission_denied");
+    expect(() => service.createBackup(manager, { passphrase: "long-passphrase", passphrase_confirmation: "long-passphrase" })).toThrow("permission_denied");
+    await expect(service.createUserPasswordReset(manager, staff.id, { send_email: false })).rejects.toThrow("permission_denied");
+
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    const otherOrder = service.createOrder(owner, { title: "Other Assigned Job", customer_id: c.id, items: [item({ title: "Other Staff Item", assigned_user_id: unassignedStaff.id })] });
+    const otherWorkOrder = service.sendOrderToProduction(owner, otherOrder.id, { mode: "whole_order" }).work_orders[0];
+    expect(service.setWorkOrderStage(staff, workOrder.id, "in_progress").work_order.production_stage).toBe("in_progress");
+    expect(service.setWorkOrderCompletion(staff, workOrder.id, true).work_order.completed).toBe(true);
+    expect(() => service.setWorkOrderStage(unassignedStaff, workOrder.id, "waiting")).toThrow("permission_denied");
+    expect(service.uploadOrderAttachment(staff, order.id, { filename: "field.txt", mime_type: "text/plain", buffer: Buffer.from("field") }).original_filename).toBe("field.txt");
+    expect(() => service.uploadOrderAttachment(unassignedStaff, order.id, { filename: "blocked.txt", mime_type: "text/plain", buffer: Buffer.from("blocked") })).toThrow("permission_denied");
+    expect(() => service.order(unassignedStaff, order.id)).toThrow("permission_denied");
+    expect(() => service.orderWorkspace(unassignedStaff, order.id)).toThrow("permission_denied");
+    expect(() => service.workOrderSummary(unassignedStaff, workOrder.id)).toThrow("permission_denied");
+    expect(() => service.listOrderAttachments(unassignedStaff, order.id)).toThrow("permission_denied");
+    const staffWorkspace = service.orderWorkspace(staff, order.id);
+    expect(staffWorkspace.attachments).toHaveLength(1);
+    expect(JSON.stringify(staffWorkspace)).not.toMatch(/unit_price_cents|line_total_cents|subtotal_cents|total_cents|discount_cents|tax_cents|payment|pricing|amount_paid|internal_notes|tax_exemption_note/i);
+    const staffBoard = service.productionBoard(staff);
+    const staffBoardIds = staffBoard.items.map((entry) => entry.id);
+    expect(staffBoardIds).toContain(workOrder.id);
+    expect(staffBoardIds).not.toContain(otherWorkOrder.id);
+    expect(staffBoard.items.find((entry) => entry.id === workOrder.id).production_progress).toMatchObject({ completed: 1, total: 1, percent: 100 });
+    const dashboardToday = new Date().toISOString().slice(0, 10);
+    const dashboardYesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    service.createOrder(owner, { title: "Hidden Customer Due", customer_id: c.id, due_date: dashboardToday, items: [item({ title: "Hidden Unassigned Panel", due_date: dashboardToday })] });
+    const directAssignedOrder = service.createOrder(owner, { title: "Direct Assigned Production", customer_id: c.id, due_date: "2020-01-02", items: [item({ title: "Legacy Assigned Panel", assigned_user_id: staff.id, due_date: "2020-01-01" })] });
+    expect(service.listOrderAttachments(staff, directAssignedOrder.id)).toEqual([]);
+    expect(service.uploadOrderAttachment(staff, directAssignedOrder.id, { filename: "legacy-field.txt", mime_type: "text/plain", buffer: Buffer.from("legacy") }).original_filename).toBe("legacy-field.txt");
+    expect(service.orderWorkspace(staff, directAssignedOrder.id).attachments).toHaveLength(1);
+    expect(() => service.listOrderAttachments(unassignedStaff, directAssignedOrder.id)).toThrow("permission_denied");
+    service.createCalendarEvent(staff, {
+      title: "Overdue personal reminder",
+      entry_type: "event",
+      schedule_category: "general",
+      assigned_user_id: staff.id,
+      start_at: `${dashboardYesterday}T09:00`,
+      end_at: `${dashboardYesterday}T10:00`,
+    });
+    const staffDashboard = service.dashboard(staff);
+    expect(JSON.stringify(staffDashboard.calendar.days)).not.toMatch(/Hidden Customer Due|Hidden Unassigned Panel|Order due|customer_name/);
+    expect(staffDashboard.attention.some((entry) => entry.reason === "production_due" && entry.title === "Legacy Assigned Panel")).toBe(true);
+    expect(staffDashboard.attention.some((entry) => entry.reason === "calendar_due" && entry.title === "Overdue personal reminder")).toBe(true);
+    expect(JSON.stringify(staffDashboard)).not.toMatch(/estimate_follow_up|payment_attention|balance_due_cents|invoice_number|estimate_number|unit_price_cents|line_total_cents|subtotal_cents|total_cents/i);
+
+    const staffEvent = service.createCalendarEvent(staff, {
+      title: "Personal shop note",
+      entry_type: "event",
+      schedule_category: "general",
+      assigned_user_id: staff.id,
+      start_at: "2026-08-22T09:00",
+      end_at: "2026-08-22T10:00",
+    });
+    expect(staffEvent.title).toBe("Personal shop note");
+    expect(() => service.createCalendarEvent(staff, {
+      title: "Other staff primary",
+      entry_type: "event",
+      schedule_category: "general",
+      primary_assignee_user_id: unassignedStaff.id,
+      start_at: "2026-08-22T11:00",
+      end_at: "2026-08-22T12:00",
+    })).toThrow("permission_denied");
+    expect(() => service.updateCalendarEvent(unassignedStaff, staffEvent.id, { title: "Nope" })).toThrow("permission_denied");
+    const coAssignedEvent = service.createCalendarEvent(manager, {
+      title: "Shared shop task",
+      entry_type: "event",
+      schedule_category: "general",
+      assigned_user_id: manager.id,
+      assignee_user_ids: [manager.id, staff.id],
+      start_at: "2026-08-22T13:00",
+      end_at: "2026-08-22T14:00",
+    });
+    expect(service.setCalendarStatus(staff, coAssignedEvent.id, "complete").status).toBe("complete");
+
+    service.createEmployee(owner, {
+      user_id: staff.id,
+      name: staff.display_name,
+      email: staff.email,
+      role: "staff",
+      portal_access_enabled: true,
+      hourly_rate_cents: 1500,
+      rate_effective_date: "2026-08-15",
+    });
+    service.createEmployee(owner, {
+      user_id: manager.id,
+      name: manager.display_name,
+      email: manager.email,
+      role: "manager",
+      portal_access_enabled: true,
+      hourly_rate_cents: 2500,
+      rate_effective_date: "2026-08-15",
+    });
+    expect(service.clockIn(staff, { note: "Start" }).open_entry.status).toBe("open");
+    expect(service.createAnnouncement(owner, { title: "Shift", body: "Read this.", audience_role: "all" }).title).toBe("Shift");
+    expect(service.sendDirectMessage(staff, { recipient_user_id: manager.id, body: "Production update" }).body).toBe("Production update");
+  });
+
+  it("enforces owner/admin privilege boundaries and revokes deactivated sessions", async () => {
+    const admin = await service.addUser(owner, {
+      display_name: "Admin",
+      email: "admin@example.com",
+      password: "password123",
+      role: "admin",
+    });
+    await expect(service.addUser(admin, {
+      display_name: "Owner Two",
+      email: "owner2@example.com",
+      password: "password123",
+      role: "owner",
+    })).rejects.toThrow("owner_role_requires_owner");
+    expect(() => service.updateUser(owner, owner.id, { role: "admin" })).toThrow("last_active_owner_required");
+    expect(() => service.updateUser(owner, owner.id, { active: false })).toThrow("last_active_owner_required");
+    const ownerTwo = await service.addUser(owner, {
+      display_name: "Owner Two",
+      email: "owner2@example.com",
+      password: "password123",
+      role: "owner",
+    });
+    const ownerTwoLogin = await service.login(
+      { tenant_slug: "shop-a", email: "owner2@example.com", password: "password123" },
+      { includeSessionCredential: true },
+    );
+    const ownerTwoReset = await service.createUserPasswordReset(owner, ownerTwo.id, { send_email: false });
+    service.updateUser(owner, ownerTwo.id, { active: false });
+    expect(() => service.actorForToken(ownerTwoLogin.token)).toThrow("unauthorized");
+    expect(db.prepare("SELECT revoked_at FROM password_reset_tokens WHERE id = ?").get(ownerTwoReset.id).revoked_at).toBeTruthy();
+    service.updateUser(owner, ownerTwo.id, { active: true });
+    await expect(service.completePasswordReset({ reset_token: ownerTwoReset.reset_token, new_password: "newpassword123" })).rejects.toThrow("password_reset_invalid");
+  });
+});
+
+describe("customers, quick entry, estimates, orders, invoices", () => {
+  it("creates portable customers and preserves tax-exempt snapshots", () => {
+    const c = customer(owner, { tax_exempt: true, tax_exemption_note: "TX resale" });
+    const estimate = service.createEstimate(owner, { title: "Test Order", customer_id: c.id, discount_cents: 0, items: [item()] });
+    expect(c.portable_id).toMatch(/^sgp_v1_customer_/);
+    expect(estimate.customer_tax_exempt_snapshot).toBe(true);
+    expect(estimate.tax_cents).toBe(0);
+  });
+
+  it("uses decimal-safe quantities and integer cents", () => {
+    expect(lineTotalCents("1.3333", 999)).toBe(1332);
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, { title: "Test Order", customer_id: c.id, items: [item({ quantity_decimal: "1.3333", unit_price_cents: 999 })] });
+    expect(estimate.items[0].line_total_cents).toBe(1332);
+    expect(() => service.createEstimate(owner, { title: "Test Order", customer_id: c.id, items: [item({ quantity_decimal: "0" })] })).toThrow();
+    expect(() => service.createEstimate(owner, { title: "Test Order", customer_id: c.id, items: [item({ unit_price_cents: Number.MAX_SAFE_INTEGER + 1 })] })).toThrow();
+  });
+
+  it("allocates discounts before tax across taxable and non-taxable lines", () => {
+    expect(documentTotals([item({ line_total_cents: 10000, taxable: true })], 1000, 1000, false)).toMatchObject({
+      subtotal_cents: 10000,
+      tax_cents: 900,
+      total_cents: 9900,
+    });
+    expect(documentTotals([item({ line_total_cents: 10000, taxable: false })], 1000, 1000, false).tax_cents).toBe(0);
+    expect(documentTotals([
+      item({ line_total_cents: 10000, taxable: true }),
+      item({ line_total_cents: 10000, taxable: false }),
+    ], 2000, 1000, false).tax_cents).toBe(900);
+    expect(documentTotals([item({ line_total_cents: 10000, taxable: true })], 0, 1000, true).tax_cents).toBe(0);
+    expect(documentTotals([item({ line_total_cents: 10000, taxable: true })], 10000, 1000, false).total_cents).toBe(0);
+  });
+
+  it("duplicates estimates with new IDs and converts idempotently to one order", () => {
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const duplicate = service.duplicateEstimate(owner, estimate.id);
+    expect(duplicate.id).not.toBe(estimate.id);
+    expect(duplicate.items[0].portable_id).not.toBe(estimate.items[0].portable_id);
+    const first = service.convertEstimate(owner, estimate.id);
+    const second = service.convertEstimate(owner, estimate.id);
+    expect(first.already_converted).toBe(false);
+    expect(second.already_converted).toBe(true);
+    expect(second.order.id).toBe(first.order.id);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM orders WHERE source_estimate_id = ?").get(estimate.id).count).toBe(1);
+  });
+
+  it("preserves estimate status, recalculates discount-only changes, and rolls back failed item replacement", () => {
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, { title: "Test Order", customer_id: c.id, status: "sent", items: [item()] });
+    const updated = service.updateEstimate(owner, estimate.id, { discount_cents: 500 });
+    expect(updated.status).toBe("sent");
+    expect(updated.discount_cents).toBe(500);
+    expect(updated.total_cents).toBeLessThan(estimate.total_cents);
+    const originalInsert = service.insertEstimateItems;
+    service.insertEstimateItems = () => {
+      throw new Error("forced_insert_failure");
+    };
+    expect(() => service.updateEstimate(owner, estimate.id, { items: [item({ description: "Replacement" })] })).toThrow("forced_insert_failure");
+    service.insertEstimateItems = originalInsert;
+    const after = service.estimate(owner, estimate.id);
+    expect(after.items[0].description).toBe("Banner");
+    expect(() => service.updateEstimate(owner, estimate.id, {})).toThrow("no_updates");
+    const converted = service.convertEstimate(owner, estimate.id).order;
+    expect(converted.id).toBeTruthy();
+    expect(() => service.updateEstimate(owner, estimate.id, { internal_notes: "locked" })).toThrow("converted_estimate_locked");
+  });
+
+  it("creates direct orders and enforces one invoice per order", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item({ taxable: false })] });
+    expect(order.source_estimate_id).toBe(null);
+    const first = service.createOrOpenInvoice(owner, order.id);
+    const second = service.createOrOpenInvoice(owner, order.id);
+    expect(first.already_exists).toBe(false);
+    expect(second.already_exists).toBe(true);
+    expect(second.invoice.id).toBe(first.invoice.id);
+  });
+
+  it("rolls back direct order creation when audit fails", () => {
+    const c = customer(owner);
+    const originalAudit = service.audit;
+    service.audit = () => {
+      throw new Error("forced_audit_failure");
+    };
+    expect(() => service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] })).toThrow("forced_audit_failure");
+    service.audit = originalAudit;
+    expect(db.prepare("SELECT COUNT(*) AS count FROM orders").get().count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_items").get().count).toBe(0);
+  });
+
+  it("keeps invoice document status separate from manual payment status", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const invoice = service.createOrOpenInvoice(owner, order.id).invoice;
+    const issued = service.setInvoiceDocumentStatus(owner, invoice.id, "issued");
+    const paid = service.recordInvoicePayment(owner, invoice.id, { amount_paid_cents: 1200 });
+    expect(issued.document_status).toBe("issued");
+    expect(paid.payment_status).toBe("partial");
+    expect(paid.document_status).toBe("issued");
+    expect(paid.balance_due_cents).toBeGreaterThan(0);
+    expect(service.listInvoices(owner)[0]).toMatchObject({
+      invoice_number: invoice.invoice_number,
+      order_number: order.order_number,
+      customer_summary: { contact_name: c.contact_name, business_name: c.business_name },
+      amount_paid_cents: 1200,
+    });
+    expect(() => service.recordInvoicePayment(owner, invoice.id, { amount_paid_cents: invoice.total_cents + 1 })).toThrow("amount_paid_exceeds_total");
+    expect(paymentStatus(invoice.total_cents, invoice.total_cents)).toBe("paid");
+  });
+
+  it("renders multipage tenant-scoped PDFs with formatted currency and without internal notes", () => {
+    const c = customer(owner);
+    service.updateSettings(owner, {
+      company_name: "Acme Signs",
+      address,
+      contact_email: "shop@example.com",
+      contact_phone: "555-0199",
+      sales_tax_rate_basis_points: 825,
+      locale: "en-US",
+      currency: "USD",
+      shop_timezone: "America/New_York",
+    });
+    const manyItems = Array.from({ length: 55 }, (_, index) => item({
+      description: `Very long wrapped description ${index} with extra words to prove line wrapping inside the generated PDF document`,
+    }));
+    const estimate = service.createEstimate(owner, { title: "Test Order", customer_id: c.id, internal_notes: "Do not print", items: manyItems });
+    const order = service.convertEstimate(owner, estimate.id).order;
+    const invoice = service.createOrOpenInvoice(owner, order.id).invoice;
+    const estimatePdf = service.documentPdf(owner, "estimate", estimate.id).toString("latin1");
+    const invoicePdf = service.documentPdf(owner, "invoice", invoice.id).toString("latin1");
+    expect(estimatePdf).toContain("Quote");
+    expect(estimatePdf).toContain("Jane Customer");
+    expect(estimatePdf).toContain("$30.00");
+    expect((estimatePdf.match(/\/Type \/Page/g) || []).length).toBeGreaterThan(1);
+    expect(estimatePdf).not.toContain("Do not print");
+    expect(invoicePdf).toContain("Payment information is manually recorded.");
+  });
+
+  it("tracks expenses with manager access, filtering, summaries, and private receipt attachments", async () => {
+    const manager = await service.addUser(owner, {
+      display_name: "Expense Manager",
+      email: "expense-manager@example.com",
+      password: "password123",
+      role: "manager",
+    });
+    const staff = await service.addUser(owner, {
+      display_name: "Expense Staff",
+      email: "expense-staff@example.com",
+      password: "password123",
+      role: "staff",
+    });
+    const expense = service.createExpense(owner, {
+      expense_date: "2026-09-01",
+      vendor: "Vinyl Supply",
+      category: "Materials",
+      description: "Rolled vinyl",
+      amount_cents: 4250,
+      payment_method: "credit_card",
+    });
+    service.createExpense(manager, {
+      expense_date: "2026-09-02",
+      vendor: "Fuel Stop",
+      category: "Vehicle",
+      amount_cents: 1800,
+      payment_method: "cash",
+    });
+
+    expect(() => service.listExpenses(staff)).toThrow("permission_denied");
+    expect(() => service.createExpense(staff, {
+      expense_date: "2026-09-03",
+      vendor: "Nope",
+      category: "Materials",
+      amount_cents: 100,
+      payment_method: "cash",
+    })).toThrow("permission_denied");
+
+    const filtered = service.listExpenses(owner, { from: "2026-09-01", to: "2026-09-30", category: "Materials" });
+    expect(filtered.items).toHaveLength(1);
+    expect(filtered.summary).toMatchObject({ total_cents: 4250, count: 1 });
+    expect(filtered.summary.by_category.Materials).toBe(4250);
+    expect(service.listExpenses(owner, { payment_method: "cash" }).items[0].vendor).toBe("Fuel Stop");
+
+    const updated = service.updateExpense(manager, expense.id, { description: "Rolled vinyl and transfer tape", amount_cents: 5000 });
+    expect(updated.description).toBe("Rolled vinyl and transfer tape");
+    expect(updated.amount_cents).toBe(5000);
+    const receipt = service.uploadExpenseAttachment(manager, expense.id, { filename: "receipt.txt", mime_type: "text/plain", buffer: Buffer.from("receipt") });
+    expect(receipt.original_filename).toBe("receipt.txt");
+    expect(service.expense(owner, expense.id).attachment.sha256).toBe(receipt.sha256);
+    expect(service.tenantStorageSummary(owner).usage_bytes).toBeGreaterThanOrEqual(Buffer.byteLength("receipt"));
+    const download = service.expenseAttachmentDownload(owner, expense.id);
+    expect(download.headers["Content-Disposition"]).toContain("receipt.txt");
+    expect((await streamToBuffer(download.stream)).toString("utf8")).toBe("receipt");
+    expect(() => service.expenseAttachmentDownload(staff, expense.id)).toThrow("permission_denied");
+    expect(service.deleteExpenseAttachment(owner, expense.id)).toMatchObject({ ok: true });
+    expect(service.expense(owner, expense.id).attachment).toBe(null);
+    const archived = service.archiveExpense(manager, expense.id);
+    expect(archived.archived_at).toBeTruthy();
+    expect(service.listExpenses(owner, { from: "2026-09-01", to: "2026-09-30" }).items.map((row) => row.vendor)).toEqual(["Fuel Stop"]);
+    const withArchived = service.listExpenses(owner, { from: "2026-09-01", to: "2026-09-30", include_archived: true });
+    expect(withArchived.items.map((row) => row.vendor)).toEqual(["Fuel Stop", "Vinyl Supply"]);
+    expect(withArchived.summary).toMatchObject({ total_cents: 6800, count: 2 });
+
+    const archivedReceiptExpense = service.createExpense(owner, {
+      expense_date: "2026-09-04",
+      vendor: "Archived Receipt",
+      category: "Office",
+      amount_cents: 900,
+      payment_method: "check",
+    });
+    service.uploadExpenseAttachment(owner, archivedReceiptExpense.id, { filename: "archived-receipt.txt", mime_type: "text/plain", buffer: Buffer.from("archived receipt") });
+    service.archiveExpense(owner, archivedReceiptExpense.id);
+    expect(service.deleteExpenseAttachment(owner, archivedReceiptExpense.id)).toMatchObject({ ok: true });
+    expect(service.expense(owner, archivedReceiptExpense.id).attachment).toBe(null);
+
+    const missingFileExpense = service.createExpense(owner, {
+      expense_date: "2026-09-05",
+      vendor: "Missing Receipt",
+      category: "Office",
+      amount_cents: 700,
+      payment_method: "check",
+    });
+    service.uploadExpenseAttachment(owner, missingFileExpense.id, { filename: "missing-receipt.txt", mime_type: "text/plain", buffer: Buffer.from("missing receipt") });
+    const missingRow = db.prepare("SELECT * FROM expense_attachments WHERE tenant_id = ? AND expense_id = ? AND deleted_at IS NULL").get(owner.tenant_id, missingFileExpense.id);
+    rmSync(service.attachmentPath(missingRow.storage_key), { force: true });
+    expect(() => service.deleteExpenseAttachment(owner, missingFileExpense.id)).toThrow("attachment_file_missing");
+    expect(db.prepare("SELECT deleted_at FROM expense_attachments WHERE id = ?").get(missingRow.id).deleted_at).toBeNull();
+
+    const rollbackExpense = service.createExpense(owner, {
+      expense_date: "2026-09-06",
+      vendor: "Rollback Receipt",
+      category: "Office",
+      amount_cents: 800,
+      payment_method: "check",
+    });
+    service.uploadExpenseAttachment(owner, rollbackExpense.id, { filename: "rollback-receipt.txt", mime_type: "text/plain", buffer: Buffer.from("rollback receipt") });
+    const rollbackRow = db.prepare("SELECT * FROM expense_attachments WHERE tenant_id = ? AND expense_id = ? AND deleted_at IS NULL").get(owner.tenant_id, rollbackExpense.id);
+    const rollbackPath = service.attachmentPath(rollbackRow.storage_key);
+    const originalAudit = service.audit;
+    service.audit = (...args) => {
+      if (args[1] === "expense.attachment_remove") throw new Error("forced_expense_audit_failure");
+      return originalAudit.call(service, ...args);
+    };
+    expect(() => service.deleteExpenseAttachment(owner, rollbackExpense.id)).toThrow("forced_expense_audit_failure");
+    service.audit = originalAudit;
+    expect(existsSync(rollbackPath)).toBe(true);
+    expect(db.prepare("SELECT deleted_at FROM expense_attachments WHERE id = ?").get(rollbackRow.id).deleted_at).toBeNull();
+    expect(service.deleteExpenseAttachment(owner, rollbackExpense.id)).toMatchObject({ ok: true });
+
+    const other = await bootstrap("expense-other");
+    expect(() => service.expense(other.user, expense.id)).toThrow("expense_not_found");
+  });
+
+  it("reports sales tax from issued invoice snapshots without counting drafts, voids, or payments", async () => {
+    const admin = await service.addUser(owner, {
+      display_name: "Tax Admin",
+      email: "tax-admin@example.com",
+      password: "password123",
+      role: "admin",
+    });
+    const manager = await service.addUser(owner, {
+      display_name: "Tax Manager",
+      email: "tax-manager@example.com",
+      password: "password123",
+      role: "manager",
+    });
+    const staff = await service.addUser(owner, {
+      display_name: "Tax Staff",
+      email: "tax-staff@example.com",
+      password: "password123",
+      role: "staff",
+    });
+    service.updateSettings(owner, { sales_tax_rate_basis_points: 825 });
+    const c = customer(owner);
+    const order = service.createOrder(owner, {
+      title: "Taxable Order",
+      customer_id: c.id,
+      document_date: "2026-09-05",
+      discount_cents: 1500,
+      items: [
+        item({ title: "Taxed", quantity_decimal: "1.0000", unit_price_cents: 10000, taxable: true }),
+        item({ title: "Untaxed", quantity_decimal: "1.0000", unit_price_cents: 5000, taxable: false }),
+      ],
+    });
+    const invoice = service.createOrOpenInvoice(owner, order.id, { document_date: "2026-09-06" }).invoice;
+    service.setInvoiceDocumentStatus(owner, invoice.id, "issued");
+    service.recordInvoicePayment(owner, invoice.id, { amount_paid_cents: invoice.total_cents });
+
+    const draftOrder = service.createOrder(owner, { title: "Draft Invoice", customer_id: c.id, document_date: "2026-09-07", items: [item()] });
+    service.createOrOpenInvoice(owner, draftOrder.id, { document_date: "2026-09-07" });
+    const voidOrder = service.createOrder(owner, { title: "Void Invoice", customer_id: c.id, document_date: "2026-09-08", items: [item()] });
+    const voidInvoice = service.createOrOpenInvoice(owner, voidOrder.id, { document_date: "2026-09-08" }).invoice;
+    service.setInvoiceDocumentStatus(owner, voidInvoice.id, "void");
+
+    const report = service.salesTaxReport(admin, { period: "month", year: "2026", month: "9" });
+    expect(report.summary).toMatchObject({
+      taxable_sales_cents: 9000,
+      non_taxable_sales_cents: 4500,
+      tax_collected_cents: invoice.tax_cents,
+      gross_sales_cents: invoice.total_cents,
+      document_count: 1,
+    });
+    expect(report.documents.map((doc) => doc.invoice_number)).toEqual([invoice.invoice_number]);
+    expect(report.disclaimer).toMatch(/does not file/i);
+    expect(() => service.salesTaxReport(manager, { period: "month", year: "2026", month: "9" })).toThrow("permission_denied");
+    expect(() => service.salesTaxReport(staff, { period: "month", year: "2026", month: "9" })).toThrow("permission_denied");
+    const other = await bootstrap("tax-other");
+    expect(service.salesTaxReport(other.user, { period: "month", year: "2026", month: "9" }).summary.document_count).toBe(0);
+  });
+
+  it("uses issued invoice bundle allocations for sales tax taxable and non-taxable splits", async () => {
+    service.updateSettings(owner, { sales_tax_rate_basis_points: 825 });
+    const c = customer(owner);
+    const order = service.createOrder(owner, {
+      title: "Bundled Tax Split",
+      customer_id: c.id,
+      document_date: "2026-10-05",
+      items: [
+        item({ title: "Taxable component", quantity_decimal: "1.0000", unit_price_cents: 10000, taxable: true }),
+        item({ title: "Non-tax component", quantity_decimal: "1.0000", unit_price_cents: 10000, taxable: false }),
+      ],
+    });
+    service.saveCommercialBundles(owner, "order", order.id, {
+      bundles: [
+        { title: "Taxed Package", pricing_mode: "bundle_price", manual_total_cents: 5000, override_reason: "Taxable package price", item_ids: [order.items[0].id] },
+        { title: "Untaxed Package", pricing_mode: "bundle_price", manual_total_cents: 15000, override_reason: "Non-taxable package price", item_ids: [order.items[1].id] },
+      ],
+    });
+    const invoice = service.createOrOpenInvoice(owner, order.id, { document_date: "2026-10-06" }).invoice;
+    service.setInvoiceDocumentStatus(owner, invoice.id, "issued");
+
+    const report = service.salesTaxReport(owner, { period: "month", year: "2026", month: "10" });
+    expect(report.summary).toMatchObject({
+      taxable_sales_cents: 5000,
+      non_taxable_sales_cents: 15000,
+      tax_collected_cents: 413,
+      gross_sales_cents: 20413,
+      document_count: 1,
+    });
+    expect(report.documents[0]).toMatchObject({ taxable_sales_cents: 5000, non_taxable_sales_cents: 15000 });
+
+    const passphrase = "long-passphrase-bundle-tax";
+    const backup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const payload = decryptBackup(backup.buffer, passphrase);
+    expect(payload.data.commercial_bundles.filter((row) => row.document_type === "invoice")).toHaveLength(2);
+    expect(payload.data.commercial_bundle_items.filter((row) => row.document_type === "invoice").map((row) => row.allocated_cents).sort((a, b) => a - b)).toEqual([5000, 15000]);
+
+    const targetSession = await bootstrap("target-bundle-tax");
+    service.restoreBackup(targetSession.user, backupFile(backup), {
+      passphrase,
+      confirmation_phrase: service.tenant(targetSession.user.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+    const restoredReport = service.salesTaxReport(targetSession.user, { period: "month", year: "2026", month: "10" });
+    expect(restoredReport.summary).toMatchObject({
+      taxable_sales_cents: 5000,
+      non_taxable_sales_cents: 15000,
+      tax_collected_cents: 413,
+      gross_sales_cents: 20413,
+      document_count: 1,
+    });
+  });
+
+  it("omits inactive bundle rows whose former item was deleted from portable backups", async () => {
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, {
+      title: "Former Bundle",
+      customer_id: c.id,
+      items: [
+        item({ title: "Kept item", quantity_decimal: "1.0000", unit_price_cents: 10000 }),
+        item({ title: "Removed item", quantity_decimal: "1.0000", unit_price_cents: 5000 }),
+      ],
+    });
+    service.saveCommercialBundles(owner, "estimate", estimate.id, {
+      bundles: [{ title: "Old bundle", pricing_mode: "itemized_subtotal", item_ids: [estimate.items[1].id] }],
+    });
+    service.saveCommercialBundles(owner, "estimate", estimate.id, { bundles: [] });
+    service.updateEstimate(owner, estimate.id, {
+      items: [item({ title: "Kept item", quantity_decimal: "1.0000", unit_price_cents: 10000 })],
+    });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM commercial_bundle_items WHERE tenant_id = ? AND document_type = 'estimate' AND document_id = ? AND active = 0").get(owner.tenant_id, estimate.id).count).toBeGreaterThan(0);
+
+    const passphrase = "long-passphrase-inactive-bundles";
+    const backup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const payload = decryptBackup(backup.buffer, passphrase);
+    expect(payload.data.commercial_bundles).toEqual([]);
+    expect(payload.data.commercial_bundle_items).toEqual([]);
+    const targetSession = await bootstrap("target-inactive-bundles");
+    expect(service.previewBackup(targetSession.user, backupFile(backup), { passphrase }).restore_permitted).toBe(true);
+  });
+
+  it("includes expenses and receipt attachments in current backups while restoring schema 015 packages without them", async () => {
+    const expense = service.createExpense(owner, {
+      expense_date: "2026-09-04",
+      vendor: "Receipt Vendor",
+      category: "Office",
+      amount_cents: 1299,
+      payment_method: "check",
+    });
+    const receipt = service.uploadExpenseAttachment(owner, expense.id, { filename: "receipt.txt", mime_type: "text/plain", buffer: Buffer.from("expense receipt") });
+    const passphrase = "long-passphrase-step3";
+    const backup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const payload = decryptBackup(backup.buffer, passphrase);
+    expect(payload.manifest.backup_format_version).toBe("signguy-slim-backup-v2");
+    expect(payload.manifest.portable_contract_version).toBe("1.1.0-step3-expenses-sales-tax");
+    expect(payload.manifest.minimum_compatible_restore_version).toBe("0.2.0-step3-expenses-sales-tax");
+    expect(payload.data.expenses).toHaveLength(1);
+    expect(payload.attachments.some((entry) => entry.metadata.owner_type === "expense" && entry.metadata.portable_id === receipt.portable_id)).toBe(true);
+
+    const targetSession = await bootstrap("target-step3");
+    const targetActor = targetSession.user;
+    service.restoreBackup(targetActor, backupFile(backup), {
+      passphrase,
+      confirmation_phrase: service.tenant(targetActor.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+    const restoredExpense = service.listExpenses(targetActor, { include_archived: true }).items[0];
+    expect(restoredExpense.vendor).toBe("Receipt Vendor");
+    expect(restoredExpense.attachment.original_filename).toBe("receipt.txt");
+    const restoredDownload = service.expenseAttachmentDownload(targetActor, restoredExpense.id);
+    expect(restoredDownload.byte_size).toBe(Buffer.byteLength("expense receipt"));
+    expect((await streamToBuffer(restoredDownload.stream)).toString("utf8")).toBe("expense receipt");
+
+    const legacyPayload = decryptBackup(backup.buffer, passphrase);
+    legacyPayload.manifest.backup_format_version = "signguy-slim-backup-v1";
+    legacyPayload.manifest.portable_contract_version = "1.0.0";
+    legacyPayload.manifest.minimum_compatible_restore_version = "0.1.0-v1-part5";
+    legacyPayload.manifest.source_schema_version = "015_commercial_release_b_account_abuse_controls.sql";
+    legacyPayload.attachments = legacyPayload.attachments.filter((entry) => entry.metadata.owner_type !== "expense");
+    delete legacyPayload.data.expenses;
+    delete legacyPayload.data.commercial_bundles;
+    delete legacyPayload.data.commercial_bundle_items;
+    delete legacyPayload.manifest.record_counts.expenses;
+    delete legacyPayload.manifest.record_counts.commercial_bundles;
+    delete legacyPayload.manifest.record_counts.commercial_bundle_items;
+    legacyPayload.manifest.data_file_inventory = legacyPayload.manifest.data_file_inventory.filter((entry) => entry.path !== "data/expenses.json");
+    legacyPayload.manifest.data_file_inventory = legacyPayload.manifest.data_file_inventory.filter((entry) => !["data/commercial_bundles.json", "data/commercial_bundle_items.json"].includes(entry.path));
+    legacyPayload.manifest.attachment_inventory = legacyPayload.manifest.attachment_inventory.filter((entry) => !entry.path.startsWith("expense-attachments/"));
+    legacyPayload.manifest.record_counts.attachments = legacyPayload.attachments.length;
+    legacyPayload.manifest.attachment_count = legacyPayload.attachments.length;
+    legacyPayload.manifest.total_attachment_bytes = legacyPayload.attachments.reduce((sum, entry) => sum + Buffer.from(entry.content_base64, "base64").length, 0);
+    legacyPayload.manifest.overall_backup_integrity = `sha256:${sha256Buffer(Buffer.from(JSON.stringify({ data: legacyPayload.data, attachments: legacyPayload.manifest.attachment_inventory }), "utf8"))}`;
+    const legacyBackup = encryptedPayload(legacyPayload, passphrase);
+    const legacyTargetSession = await bootstrap("target-legacy-step3");
+    const legacyPreview = service.previewBackup(legacyTargetSession.user, backupFile(legacyBackup), { passphrase });
+    expect(legacyPreview.restore_permitted).toBe(true);
+    expect(legacyPreview.counts).not.toHaveProperty("expenses");
+  });
+});
+
+describe("Commercial Release B account and abuse controls", () => {
+  it("disables public production registration unless a single-use invitation is supplied", async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousPublicRegistration = process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+    try {
+      process.env.NODE_ENV = "production";
+      delete process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+      process.env.SIGNGUY_SLIM_APP_URL = "https://slim.example.com";
+
+      await expect(service.registerTenant({
+        tenant_name: "Blocked Shop",
+        tenant_slug: "blocked-shop",
+        owner_name: "Owner",
+        owner_email: "blocked@example.com",
+        owner_password: "password123",
+      })).rejects.toThrow("signup_invite_required");
+
+      const invitation = service.createSignupInvitation(owner, { email: "invited@example.com", expires_in_hours: 24 });
+      expect(invitation.invite_url).toContain("/#/register?invite=");
+      expect(db.prepare("SELECT token_hash FROM signup_invitations WHERE id = ?").get(invitation.id).token_hash).not.toContain(invitation.invite_token);
+      const session = await service.registerTenant({
+        tenant_name: "Invited Shop",
+        tenant_slug: "invited-shop",
+        owner_name: "Invited Owner",
+        owner_email: "invited@example.com",
+        owner_password: "password123",
+        invite_token: invitation.invite_token,
+      });
+      expect(session.user.email).toBe("invited@example.com");
+      const used = db.prepare("SELECT used_at, consumed_tenant_id, consumed_user_id FROM signup_invitations WHERE id = ?").get(invitation.id);
+      expect(used.used_at).toBeTruthy();
+      expect(used.consumed_tenant_id).toBe(session.user.tenant_id);
+      expect(used.consumed_user_id).toBe(session.user.id);
+      await expect(service.registerTenant({
+        tenant_name: "Reuse Shop",
+        tenant_slug: "reuse-shop",
+        owner_name: "Owner",
+        owner_email: "invited@example.com",
+        owner_password: "password123",
+        invite_token: invitation.invite_token,
+      })).rejects.toThrow("signup_invite_invalid");
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousPublicRegistration === undefined) delete process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+      else process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED = previousPublicRegistration;
+    }
+  });
+
+  it("revokes active invitations without exposing stored tokens", async () => {
+    process.env.SIGNGUY_SLIM_APP_URL = "https://slim.example.com";
+    const invitation = service.createSignupInvitation(owner, { email: "leaked@example.com" });
+    const listed = service.listSignupInvitations(owner);
+    expect(listed).toHaveLength(1);
+    expect(JSON.stringify(listed)).not.toContain(invitation.invite_token);
+
+    const revoked = service.revokeSignupInvitation(owner, invitation.id);
+    expect(revoked.revoked_at).toBeTruthy();
+    await expect(service.registerTenant({
+      tenant_name: "Leaked Invite",
+      tenant_slug: "leaked-invite",
+      owner_name: "Owner",
+      owner_email: "leaked@example.com",
+      owner_password: "password123",
+      invite_token: invitation.invite_token,
+    })).rejects.toThrow("signup_invite_invalid");
+  });
+
+  it("bounds invitation history and keeps tenant history indexed", () => {
+    for (let index = 0; index < 105; index += 1) {
+      service.createSignupInvitation(owner, { email: `invite-${index}@example.com` });
+    }
+
+    const listed = service.listSignupInvitations(owner);
+    expect(listed).toHaveLength(100);
+    expect(JSON.stringify(listed)).not.toContain("invite_token");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM signup_invitations WHERE created_by_tenant_id = ?").get(owner.tenant_id).count).toBe(105);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_signup_invitations_tenant_created'").get().name).toBe("idx_signup_invitations_tenant_created");
+  });
+
+  it("rate limits security-sensitive scopes with hashed bucket keys", () => {
+    process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT = "2";
+    process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_WINDOW_SECONDS = "60";
+    service.enforceRateLimit("login_ip", { ip: "203.0.113.10" });
+    service.enforceRateLimit("login_ip", { ip: "203.0.113.10" });
+    expect(() => service.enforceRateLimit("login_ip", { ip: "203.0.113.10" })).toThrow("rate_limit_exceeded");
+    const row = db.prepare("SELECT bucket_key_hash FROM rate_limit_buckets WHERE scope = 'login_ip'").get();
+    expect(row.bucket_key_hash).not.toContain("203.0.113.10");
+  });
+
+  it("keeps hosted storage quota host-managed rather than tenant self-service", () => {
+    db.prepare("UPDATE tenants SET storage_quota_bytes = ? WHERE id = ?").run(6, owner.tenant_id);
+    expect(() => service.updateStorageQuota(owner, { storage_quota_bytes: 1024 * 1024 * 1024 })).toThrow("storage_quota_host_managed");
+    expect(db.prepare("SELECT storage_quota_bytes FROM tenants WHERE id = ?").get(owner.tenant_id).storage_quota_bytes).toBe(6);
+  });
+
+  it("completes password reset with hashed single-use tokens and revokes active sessions", async () => {
+    const session = service.issueSessionEnvelope(owner);
+    const reset = await service.createUserPasswordReset(owner, owner.id, { send_email: false });
+    const stored = db.prepare("SELECT token_hash FROM password_reset_tokens WHERE id = ?").get(reset.id);
+    expect(stored.token_hash).toBe(hashToken(reset.reset_token));
+    expect(stored.token_hash).not.toBe(reset.reset_token);
+
+    await service.completePasswordReset({ reset_token: reset.reset_token, new_password: "newpassword123" });
+    expect(() => service.actorForToken(session.token)).toThrow("unauthorized");
+    await expect(service.login({ tenant_slug: "shop-a", email: "shop-a@example.com", password: "password123" })).rejects.toThrow("invalid_shop_email_or_password");
+    const next = await service.login({ tenant_slug: "shop-a", email: "shop-a@example.com", password: "newpassword123" });
+    expect(next.user.id).toBe(owner.id);
+    await expect(service.completePasswordReset({ reset_token: reset.reset_token, new_password: "anotherpass123" })).rejects.toThrow("password_reset_invalid");
+  });
+
+  it("returns generic public reset responses without account enumeration", async () => {
+    const known = await service.requestPasswordReset({ email: "shop-a@example.com" });
+    const unknown = await service.requestPasswordReset({ email: "missing@example.com" });
+    expect(known).toEqual(unknown);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens").get().count).toBe(0);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens").get().count).toBe(1);
+  });
+
+  it("does not revoke a usable reset token when replacement email delivery fails", async () => {
+    const existing = await service.createUserPasswordReset(owner, owner.id, { send_email: false });
+    await service.requestPasswordReset({ email: "shop-a@example.com" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const existingRow = db.prepare("SELECT revoked_at FROM password_reset_tokens WHERE id = ?").get(existing.id);
+    const failedRow = db.prepare("SELECT revoked_at, email_delivery_state FROM password_reset_tokens WHERE id <> ?").get(existing.id);
+    expect(existingRow.revoked_at).toBeNull();
+    expect(failedRow).toMatchObject({ email_delivery_state: "failed" });
+    expect(failedRow.revoked_at).toBeTruthy();
+
+    await service.completePasswordReset({ reset_token: existing.reset_token, new_password: "newpassword123" });
+    const login = await service.login({ tenant_slug: "shop-a", email: "shop-a@example.com", password: "newpassword123" });
+    expect(login.user.id).toBe(owner.id);
+  });
+
+  it("uses a verified recovery sender and revokes prior reset tokens after successful delivery", async () => {
+    const delivered = [];
+    service.emailTransport = async (payload) => {
+      delivered.push(payload);
+      return { provider_message_id: "reset-provider-1" };
+    };
+    process.env.SIGNGUY_SLIM_RECOVERY_FROM_EMAIL = "recovery@example.com";
+    service.updateSettings(owner, { contact_email: "unverified-contact@example.com" });
+    service.updateEmailSettings(owner, { sender_name: "Shop", sender_email: "shop@example.com", sendgrid_verified: false });
+    const existing = await service.createUserPasswordReset(owner, owner.id, { send_email: false });
+
+    await service.requestPasswordReset({ email: "shop-a@example.com" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(delivered[0].from.email).toBe("recovery@example.com");
+    expect(db.prepare("SELECT revoked_at FROM password_reset_tokens WHERE id = ?").get(existing.id).revoked_at).toBeTruthy();
+    const replacement = db.prepare("SELECT email_delivery_state, revoked_at, provider_message_id FROM password_reset_tokens WHERE id <> ?").get(existing.id);
+    expect(replacement).toMatchObject({ email_delivery_state: "sent", revoked_at: null, provider_message_id: "reset-provider-1" });
+    expect(delivered[0].content[0].value).toContain("shop-a");
+  });
+
+  it("binds tenant recovery sender verification to the current sender address", async () => {
+    const delivered = [];
+    service.emailTransport = async (payload) => {
+      delivered.push(payload);
+      return { provider_message_id: "reset-provider-tenant" };
+    };
+
+    service.updateEmailSettings(owner, { sender_name: "Shop", sender_email: "verified@example.com", sendgrid_verified: true });
+    expect(service.emailSettings(owner)).toMatchObject({
+      sender_email: "verified@example.com",
+      sendgrid_verified: false,
+      sender_verified_email: null,
+    });
+    db.prepare("UPDATE tenant_email_settings SET sendgrid_verified = 1, sender_verified_email = ? WHERE tenant_id = ?").run("verified@example.com", owner.tenant_id);
+    await expect(service.deliverPasswordResetEmail(owner, "https://slim.example.test/#/reset-password?token=abc")).resolves.toMatchObject({
+      state: "sent",
+      provider_message_id: "reset-provider-tenant",
+    });
+    expect(delivered[0].from.email).toBe("verified@example.com");
+    expect(service.emailSettings(owner)).toMatchObject({
+      sender_email: "verified@example.com",
+      sendgrid_verified: true,
+      sender_verified_email: "verified@example.com",
+    });
+
+    service.updateEmailSettings(owner, { sender_email: "mistyped@example.com", sendgrid_verified: true });
+    expect(service.emailSettings(owner)).toMatchObject({
+      sender_email: "mistyped@example.com",
+      sendgrid_verified: false,
+      sender_verified_email: null,
+    });
+    await expect(service.deliverPasswordResetEmail(owner, "https://slim.example.test/#/reset-password?token=def")).rejects.toThrow("email_sender_required");
+  });
+
+  it("skips scheduled public reset delivery when the selected user becomes inactive", async () => {
+    const staff = await service.addUser(owner, {
+      display_name: "Reset Staff",
+      email: "reset-staff@example.com",
+      password: "password123",
+      role: "staff",
+    });
+    const delivered = [];
+    service.emailTransport = async (payload) => {
+      delivered.push(payload);
+      return { provider_message_id: "reset-provider-staff" };
+    };
+    process.env.SIGNGUY_SLIM_RECOVERY_FROM_EMAIL = "recovery@example.com";
+
+    await service.requestPasswordReset({ email: "reset-staff@example.com" });
+    service.updateUser(owner, staff.id, { active: false });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(delivered).toHaveLength(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens WHERE user_id = ?").get(staff.id).count).toBe(0);
+  });
+
+  it("leaves the latest reset token usable after overlapping successful deliveries", async () => {
+    const deliveries = [];
+    service.emailTransport = async () => new Promise((resolve) => deliveries.push(resolve));
+    process.env.SIGNGUY_SLIM_RECOVERY_FROM_EMAIL = "recovery@example.com";
+
+    await service.requestPasswordReset({ email: "shop-a@example.com" });
+    await new Promise((resolve) => setImmediate(resolve));
+    await service.requestPasswordReset({ email: "shop-a@example.com" });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(deliveries).toHaveLength(2);
+
+    deliveries[0]({ provider_message_id: "reset-provider-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    deliveries[1]({ provider_message_id: "reset-provider-2" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const rows = db.prepare("SELECT provider_message_id, revoked_at FROM password_reset_tokens ORDER BY created_at, id").all();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ provider_message_id: "reset-provider-1" });
+    expect(rows[0].revoked_at).toBeTruthy();
+    expect(rows[1]).toMatchObject({ provider_message_id: "reset-provider-2", revoked_at: null });
+  });
+
+  it("breaks same-timestamp reset supersession ties deterministically", async () => {
+    const deliveries = [];
+    service.emailTransport = async () => new Promise((resolve) => deliveries.push(resolve));
+    process.env.SIGNGUY_SLIM_RECOVERY_FROM_EMAIL = "recovery@example.com";
+
+    await service.requestPasswordReset({ email: "shop-a@example.com" });
+    await new Promise((resolve) => setImmediate(resolve));
+    await service.requestPasswordReset({ email: "shop-a@example.com" });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(deliveries).toHaveLength(2);
+
+    db.prepare("UPDATE password_reset_tokens SET created_at = ?").run("2300-01-01T00:00:00.000Z");
+    deliveries[0]({ provider_message_id: "reset-provider-1" });
+    await new Promise((resolve) => setImmediate(resolve));
+    deliveries[1]({ provider_message_id: "reset-provider-2" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const rows = db.prepare("SELECT id, provider_message_id, revoked_at FROM password_reset_tokens ORDER BY id").all();
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((row) => !row.revoked_at)).toEqual([rows[1]]);
+  });
+
+  it("bounds duplicate-email public reset fan-out without permanently starving later tenants", async () => {
+    const delivered = [];
+    service.emailTransport = async (payload) => {
+      delivered.push(payload);
+      return { provider_message_id: `reset-provider-${delivered.length}` };
+    };
+    process.env.SIGNGUY_SLIM_RECOVERY_FROM_EMAIL = "recovery@example.com";
+    for (let index = 0; index < 4; index += 1) {
+      await service.registerTenant({
+        tenant_name: `Duplicate Email ${index}`,
+        tenant_slug: `duplicate-email-${index}`,
+        owner_name: "Owner",
+        owner_email: "shared-reset@example.com",
+        owner_password: "password123",
+      });
+    }
+
+    const nowSpy = vi.spyOn(Date, "now");
+    try {
+      nowSpy.mockReturnValue(new Date("2300-01-01T00:00:00.000Z").getTime());
+      await service.requestPasswordReset({ email: "shared-reset@example.com" });
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      nowSpy.mockReturnValue(new Date("2300-01-01T01:00:00.000Z").getTime());
+      await service.requestPasswordReset({ email: "shared-reset@example.com" });
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(delivered).toHaveLength(6);
+    const duplicateTenantIds = db
+      .prepare("SELECT id FROM tenants WHERE slug LIKE 'duplicate-email-%' ORDER BY slug")
+      .all()
+      .map((tenant) => tenant.id);
+    for (const tenantId of duplicateTenantIds) {
+      expect(delivered.some((payload) => payload.custom_args.tenant_id === tenantId)).toBe(true);
+    }
+    expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens WHERE requested_email = ?").get("shared-reset@example.com").count).toBe(3);
+  });
+
+  it("prunes expired password reset credentials before creating new reset rows", async () => {
+    const expired = await service.createUserPasswordReset(owner, owner.id, { send_email: false });
+    db.prepare("UPDATE password_reset_tokens SET expires_at = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", expired.id);
+
+    const next = await service.createUserPasswordReset(owner, owner.id, { send_email: false });
+
+    expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens WHERE id = ?").get(expired.id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens WHERE id = ?").get(next.id).count).toBe(1);
+  });
+
+  it("rejects expired or mismatched signup invitations without consuming them", async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousPublicRegistration = process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+    try {
+      process.env.NODE_ENV = "production";
+      delete process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+      process.env.SIGNGUY_SLIM_APP_URL = "https://slim.example.com";
+      const mismatched = service.createSignupInvitation(owner, { email: "invited@example.com" });
+      await expect(service.registerTenant({
+        tenant_name: "Wrong Email",
+        tenant_slug: "wrong-email",
+        owner_name: "Owner",
+        owner_email: "different@example.com",
+        owner_password: "password123",
+        invite_token: mismatched.invite_token,
+      })).rejects.toThrow("signup_invite_invalid");
+      expect(db.prepare("SELECT used_at FROM signup_invitations WHERE id = ?").get(mismatched.id).used_at).toBeNull();
+
+      const expired = service.createSignupInvitation(owner, { email: "expired@example.com" });
+      db.prepare("UPDATE signup_invitations SET expires_at = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", expired.id);
+      await expect(service.registerTenant({
+        tenant_name: "Expired Invite",
+        tenant_slug: "expired-invite",
+        owner_name: "Owner",
+        owner_email: "expired@example.com",
+        owner_password: "password123",
+        invite_token: expired.invite_token,
+      })).rejects.toThrow("signup_invite_invalid");
+      expect(db.prepare("SELECT used_at FROM signup_invitations WHERE id = ?").get(expired.id).used_at).toBeNull();
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousPublicRegistration === undefined) delete process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+      else process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED = previousPublicRegistration;
+    }
+  });
+
+  it("requires an explicit HTTPS app URL before persisting production invite or reset tokens", async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousAppUrl = process.env.SIGNGUY_SLIM_APP_URL;
+    try {
+      process.env.NODE_ENV = "production";
+      delete process.env.SIGNGUY_SLIM_APP_URL;
+
+      expect(() => service.createSignupInvitation(owner, { email: "invite@example.com" })).toThrow("production_app_url_required");
+      expect(db.prepare("SELECT COUNT(*) AS count FROM signup_invitations").get().count).toBe(0);
+
+      await expect(service.createUserPasswordReset(owner, owner.id, { send_email: false })).rejects.toThrow("production_app_url_required");
+      expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens").get().count).toBe(0);
+
+      process.env.SIGNGUY_SLIM_APP_URL = "http://slim.example.com";
+      expect(() => service.createSignupInvitation(owner, { email: "invite@example.com" })).toThrow("production_app_url_must_be_https");
+      expect(db.prepare("SELECT COUNT(*) AS count FROM signup_invitations").get().count).toBe(0);
+
+      process.env.SIGNGUY_SLIM_APP_URL = "https://slim.example.com/#/";
+      expect(() => service.createSignupInvitation(owner, { email: "invite@example.com" })).toThrow("app_url_must_be_origin");
+      process.env.SIGNGUY_SLIM_APP_URL = "https://slim.example.com/?next=/";
+      await expect(service.createUserPasswordReset(owner, owner.id, { send_email: false })).rejects.toThrow("app_url_must_be_origin");
+      process.env.SIGNGUY_SLIM_APP_URL = "https://slim.example.com/app";
+      expect(() => service.createSignupInvitation(owner, { email: "invite@example.com" })).toThrow("app_url_must_be_origin");
+      expect(db.prepare("SELECT COUNT(*) AS count FROM signup_invitations").get().count).toBe(0);
+      expect(db.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens").get().count).toBe(0);
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousAppUrl === undefined) delete process.env.SIGNGUY_SLIM_APP_URL;
+      else process.env.SIGNGUY_SLIM_APP_URL = previousAppUrl;
+    }
+  });
+
+  it("validates Release B production account-control settings during startup preflight", () => {
+    const productionEnv = {
+      NODE_ENV: "production",
+      SIGNGUY_SLIM_DB_PATH: join(attachmentRoot, "prod.sqlite"),
+      SIGNGUY_SLIM_ATTACHMENT_ROOT: join(attachmentRoot, "attachments"),
+      SIGNGUY_SLIM_SERVER_BACKUP_ROOT: join(attachmentRoot, "server-backups"),
+      SIGNGUY_SLIM_APP_URL: "https://slim.example.com",
+      SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED: "0",
+      SIGNGUY_SLIM_DEFAULT_TENANT_STORAGE_QUOTA_BYTES: "1048576",
+      SIGNGUY_SLIM_PASSWORD_RESET_LIFETIME_SECONDS: "900",
+      SIGNGUY_SLIM_PASSWORD_RESET_REQUEST_MAX_MATCHES: "3",
+      SIGNGUY_SLIM_SIGNUP_INVITATION_LIFETIME_SECONDS: "3600",
+      SIGNGUY_SLIM_RECOVERY_FROM_EMAIL: "recovery@example.com",
+      SIGNGUY_SLIM_TRUST_PROXY_HOPS: "2",
+      SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT: "5",
+      SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_WINDOW_SECONDS: "60",
+    };
+
+    const config = validateProductionConfig({ env: productionEnv, checkWritable: false });
+    expect(config.appPublicUrl).toBe("https://slim.example.com");
+    expect(config.passwordResetLifetimeSeconds).toBe(900);
+    expect(config.passwordResetRequestMaxMatches).toBe(3);
+    expect(config.recoveryFromEmail).toBe("recovery@example.com");
+    expect(config.signupInvitationLifetimeSeconds).toBe(3600);
+    expect(config.trustedProxyEnabled).toBe(false);
+    expect(config.trustedProxyHops).toBe(2);
+    expect(config.rateLimits.login_ip).toEqual({ limit: 5, windowSeconds: 60 });
+
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_PASSWORD_RESET_LIFETIME_SECONDS: "oops" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_password_reset_lifetime_seconds_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_SIGNUP_INVITATION_LIFETIME_SECONDS: "0" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_signup_invitation_lifetime_seconds_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_PASSWORD_RESET_REQUEST_MAX_MATCHES: "100" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_password_reset_request_max_matches_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT: "none" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_rate_limit_login_ip_limit_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_RECOVERY_FROM_EMAIL: "reset@" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_recovery_from_email_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_RECOVERY_FROM_EMAIL: "" },
+      checkWritable: false,
+    })).toThrow("production_recovery_from_email_required");
+    for (const invalidEmail of ["reset@example.com,", ".reset@example.com", "reset@example..com"]) {
+      expect(() => validateProductionConfig({
+        env: { ...productionEnv, SIGNGUY_SLIM_RECOVERY_FROM_EMAIL: invalidEmail },
+        checkWritable: false,
+      })).toThrow("signguy_slim_recovery_from_email_invalid");
+    }
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED: "treu" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_public_registration_enabled_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_TRUST_PROXY_HOPS: "0" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_trust_proxy_hops_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_TRUST_PROXY: "true" },
+      checkWritable: false,
+    })).toThrow("signguy_slim_trust_proxy_invalid");
+    expect(validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_TRUST_PROXY: "1" },
+      checkWritable: false,
+    }).trustedProxyEnabled).toBe(true);
+    expect(() => validateProductionConfig({
+      env: { ...productionEnv, SIGNGUY_SLIM_APP_URL: "https://slim.example.com/#/" },
+      checkWritable: false,
+    })).toThrow("app_url_must_be_origin");
+
+    const envWithoutNodeEnv = { ...productionEnv };
+    delete envWithoutNodeEnv.NODE_ENV;
+    expect(validateProductionConfig({
+      env: envWithoutNodeEnv,
+      production: true,
+      checkWritable: false,
+    }).publicRegistrationEnabled).toBe(false);
+    expect(() => validateProductionConfig({
+      env: { ...envWithoutNodeEnv, SIGNGUY_SLIM_APP_URL: "http://localhost:5173" },
+      production: true,
+      checkWritable: false,
+    })).toThrow("production_app_url_must_be_https");
+    expect(() => validateProductionConfig({
+      env: { ...envWithoutNodeEnv, SIGNGUY_SLIM_PASSWORD_RESET_LIFETIME_SECONDS: "oops" },
+      production: true,
+      checkWritable: false,
+    })).toThrow("signguy_slim_password_reset_lifetime_seconds_invalid");
+    expect(() => validateProductionConfig({
+      env: { ...envWithoutNodeEnv, SIGNGUY_SLIM_TRUST_PROXY_HOPS: "oops" },
+      production: true,
+      checkWritable: false,
+    })).toThrow("signguy_slim_trust_proxy_hops_invalid");
+  });
+
+  it("creates an operator bootstrap invitation only before the first tenant exists", async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousAppUrl = process.env.SIGNGUY_SLIM_APP_URL;
+    const freshDb = migratedMemoryDatabase();
+    const freshService = new SlimService(freshDb);
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.SIGNGUY_SLIM_APP_URL = "https://slim.example.com";
+      const execSpy = vi.spyOn(freshDb, "exec");
+      const invitation = freshService.createBootstrapSignupInvitation({ email: "first-owner@example.com", expires_in_hours: 24 });
+
+      expect(invitation.invite_token).toBeTruthy();
+      expect(invitation.invite_url).toContain("https://slim.example.com/#/register?invite=");
+      expect(execSpy).toHaveBeenCalledWith("BEGIN IMMEDIATE");
+      const row = freshDb.prepare("SELECT * FROM signup_invitations WHERE id = ?").get(invitation.id);
+      expect(row.created_by_tenant_id).toBeNull();
+      expect(row.created_by_user_id).toBeNull();
+      expect(() => freshService.createBootstrapSignupInvitation({ email: "retry@example.com" })).toThrow("bootstrap_invitation_already_exists");
+
+      const revoked = freshService.revokeBootstrapSignupInvitations();
+      expect(revoked.revoked_count).toBe(1);
+      expect(freshDb.prepare("SELECT revoked_at FROM signup_invitations WHERE id = ?").get(invitation.id).revoked_at).toBeTruthy();
+      expect(() => freshService.signupInvitationForToken(invitation.invite_token, "first-owner@example.com")).toThrow("signup_invite_invalid");
+
+      const replacement = freshService.createBootstrapSignupInvitation({ email: "first-owner@example.com", expires_in_hours: 24 });
+
+      const session = await freshService.registerTenant({
+        tenant_name: "First Shop",
+        tenant_slug: "first-shop",
+        owner_name: "First Owner",
+        owner_email: "first-owner@example.com",
+        owner_password: "password123",
+        invite_token: replacement.invite_token,
+      });
+      expect(session.tenant.slug).toBe("first-shop");
+      expect(freshDb.prepare("SELECT used_at FROM signup_invitations WHERE id = ?").get(replacement.id).used_at).toBeTruthy();
+      expect(() => freshService.createBootstrapSignupInvitation({ email: "second@example.com" })).toThrow("bootstrap_invitation_unavailable");
+    } finally {
+      freshDb.close();
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousAppUrl === undefined) delete process.env.SIGNGUY_SLIM_APP_URL;
+      else process.env.SIGNGUY_SLIM_APP_URL = previousAppUrl;
+    }
+  });
+
+  it("rejects positional bootstrap invitation CLI arguments", () => {
+    const result = spawnSync(process.execPath, ["backend/src/account-controls-cli.js", "create-bootstrap-invitation", "owner@example.com"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("account_control_positional_args_unexpected");
+  });
+
+  it("creates an audited operator password reset link for an existing tenant user", async () => {
+    const root = mkdtempSync(join(tmpdir(), "signguy-slim-account-cli-"));
+    const dbPath = join(root, "account-cli.sqlite");
+    const cliDb = openDatabase(dbPath);
+    try {
+      runMigrations(cliDb);
+      const cliService = new SlimService(cliDb);
+      await cliService.registerTenant({
+        tenant_name: "CLI Recovery Shop",
+        tenant_slug: "cli-recovery-shop",
+        owner_name: "Owner",
+        owner_email: "cli-owner@example.com",
+        owner_password: "password123",
+      });
+    } finally {
+      cliDb.close();
+    }
+
+    try {
+      const result = spawnSync(process.execPath, [
+        "backend/src/account-controls-cli.js",
+        "create-operator-password-reset",
+        "--tenant-slug",
+        "cli-recovery-shop",
+        "--email",
+        "cli-owner@example.com",
+      ], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SIGNGUY_SLIM_DB_PATH: dbPath,
+          SIGNGUY_SLIM_APP_URL: "https://slim.example.test",
+        },
+      });
+      expect(result.status).toBe(0);
+      const body = JSON.parse(result.stdout);
+      expect(body.reset_token).toBeTruthy();
+      expect(body.reset_url).toContain("https://slim.example.test/#/reset-password?token=");
+
+      const verifyDb = openDatabase(dbPath);
+      try {
+        expect(verifyDb.prepare("SELECT COUNT(*) AS count FROM password_reset_tokens WHERE user_id = ? AND used_at IS NULL AND revoked_at IS NULL").get(body.user_id).count).toBe(1);
+        expect(verifyDb.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = ? AND entity_id = ?").get("password_reset.operator_create", body.user_id).count).toBe(1);
+      } finally {
+        verifyDb.close();
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks inactive-user password reset completion and preserves other users' sessions", async () => {
+    const staff = await service.addUser(owner, {
+      display_name: "Staff User",
+      email: "staff@example.com",
+      password: "password123",
+      role: "staff",
+      active: true,
+    });
+    const ownerSession = service.issueSessionEnvelope(owner);
+    const staffSession = service.issueSessionEnvelope(staff);
+    const reset = await service.createUserPasswordReset(owner, staff.id, { send_email: false });
+
+    service.updateUser(owner, staff.id, { display_name: "Staff User", active: false });
+    await expect(service.completePasswordReset({ reset_token: reset.reset_token, new_password: "newpassword123" })).rejects.toThrow("password_reset_invalid");
+    expect(() => service.actorForToken(staffSession.token)).toThrow("unauthorized");
+    expect(service.actorForToken(ownerSession.token).id).toBe(owner.id);
+  });
+
+  it("enforces tenant storage quota for active attachments and preserves existing files on overage", () => {
+    db.prepare("UPDATE tenants SET storage_quota_bytes = ? WHERE id = ?").run(6, owner.tenant_id);
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Quota Order", customer_id: c.id, items: [item()] });
+    service.uploadOrderAttachment(owner, order.id, { filename: "first.txt", mime_type: "text/plain", buffer: Buffer.from("12345") });
+    expect(service.tenantStorageSummary(owner)).toMatchObject({ usage_bytes: 5, quota_bytes: 6, remaining_bytes: 1 });
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "second.txt", mime_type: "text/plain", buffer: Buffer.from("12") })).toThrow("storage_quota_exceeded");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_attachments WHERE tenant_id = ? AND deleted_at IS NULL").get(owner.tenant_id).count).toBe(1);
+    expect(countFiles(attachmentRoot)).toBe(1);
+  });
+
+  it("keeps retained deleted attachment bytes charged against tenant quota", () => {
+    db.prepare("UPDATE tenants SET storage_quota_bytes = ? WHERE id = ?").run(6, owner.tenant_id);
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Quota Delete", customer_id: c.id, items: [item()] });
+    const first = service.uploadOrderAttachment(owner, order.id, { filename: "first.txt", mime_type: "text/plain", buffer: Buffer.from("12345") });
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "second.txt", mime_type: "text/plain", buffer: Buffer.from("12") })).toThrow("storage_quota_exceeded");
+
+    service.deleteOrderAttachment(owner, order.id, first.id);
+    expect(service.tenantStorageSummary(owner)).toMatchObject({ usage_bytes: 5, quota_bytes: 6, remaining_bytes: 1 });
+    const second = service.uploadOrderAttachment(owner, order.id, { filename: "second.txt", mime_type: "text/plain", buffer: Buffer.from("1") });
+    expect(second.byte_size).toBe(1);
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "third.txt", mime_type: "text/plain", buffer: Buffer.from("1") })).toThrow("storage_quota_exceeded");
+  });
+
+  it("enforces quota for annotation derivatives and accepted intake attachments", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Quota Paths", customer_id: c.id, items: [item()] });
+    const original = service.uploadOrderAttachment(owner, order.id, { filename: "original.png", mime_type: "image/png", buffer: tinyPng() });
+    db.prepare("UPDATE tenants SET storage_quota_bytes = ? WHERE id = ?").run(original.byte_size + 1, owner.tenant_id);
+    expect(() => service.createAnnotatedAttachment(owner, order.id, original.id, {
+      filename: "annotated.png",
+      mime_type: "image/png",
+      buffer: tinyPng(),
+      fields: { annotation_json: JSON.stringify(annotationOps()) },
+    })).toThrow("storage_quota_exceeded");
+
+    service.deleteOrderAttachment(owner, order.id, original.id);
+    db.prepare("UPDATE tenants SET storage_quota_bytes = ? WHERE id = ?").run(4, owner.tenant_id);
+    const intake = service.receiveEmailIntake({
+      provider_message_id: "quota-intake-001",
+      intake_address: service.settings(owner).intake_address.full_address,
+      sender_name: "Buyer",
+      sender_email: "buyer@example.com",
+      recipients: [service.settings(owner).intake_address.full_address],
+      subject: "Quota intake",
+      text_body: "Please review.",
+      attachments: [{
+        original_filename: "proof.txt",
+        mime_type: "text/plain",
+        byte_size: 5,
+        sha256: createHash("sha256").update("12345").digest("hex"),
+        content_base64: Buffer.from("12345").toString("base64"),
+      }],
+    });
+    expect(intake.item.attachments[0]).toMatchObject({ accepted: false, rejection_reason: "storage_quota_exceeded" });
+    expect(db.prepare("SELECT storage_key FROM intake_attachments WHERE id = ?").get(intake.item.attachments[0].id).storage_key).toBeNull();
+  });
+
+  it("keeps Release B runtime control tables out of portable customer backups", async () => {
+    service.enforceRateLimit("login_ip", { ip: "198.51.100.1" });
+    service.createSignupInvitation(owner, { email: "next@example.com" });
+    await service.createUserPasswordReset(owner, owner.id, { send_email: false });
+    const backup = service.createBackup(owner, { passphrase: "long-passphrase-4", passphrase_confirmation: "long-passphrase-4" });
+    const payload = decryptBackup(backup.buffer, "long-passphrase-4");
+    expect(payload.data.rate_limit_buckets).toBeUndefined();
+    expect(payload.data.signup_invitations).toBeUndefined();
+    expect(payload.data.password_reset_tokens).toBeUndefined();
+    expect(payload.data.tenants[0]).not.toHaveProperty("storage_quota_bytes");
+  });
+});
+
+describe("HTTP API safety", () => {
+  async function withServer(work) {
+    const httpDb = migratedMemoryDatabase();
+    const server = createSlimServer(httpDb);
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${server.address().port}/api`;
+    try {
+      await work(base, httpDb);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
+  it("authenticates PDFs, rejects unauthenticated access, and handles malformed JSON", async () => {
+    await withServer(async (base) => {
+      const bad = await fetch(`${base}/auth/register`, { method: "POST", body: "{" });
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toMatchObject({ error: "malformed_json" });
+
+      const auth = await registerHttpSession(base, {
+        tenant_name: "HTTP Shop",
+        tenant_slug: "http-shop",
+        owner_name: "Owner",
+        owner_email: "owner@example.com",
+        owner_password: "password123",
+      });
+      expect(auth.response.headers.get("set-cookie")).toContain("HttpOnly");
+      expect(auth.response.headers.get("set-cookie")).toContain("SameSite=Lax");
+      expect(auth.response.headers.get("set-cookie")).toContain("signguy_slim_session=");
+      expect(auth.response.headers.get("set-cookie")).toContain("Max-Age=");
+      expect(auth.response.headers.get("set-cookie")).not.toContain("Secure");
+      expect(auth.session.access_token).toBeUndefined();
+      expect(auth.session.session_token).toBeUndefined();
+      expect(JSON.stringify(auth.session)).not.toContain(cookieValue(auth.cookie));
+      expect(auth.session.csrf_token).toBeTruthy();
+      const missingCsrfSample = await fetch(`${base}/dashboard/sample-data`, {
+        method: "POST",
+        headers: { Cookie: auth.cookie },
+      });
+      expect(missingCsrfSample.status).toBe(403);
+      expect(await missingCsrfSample.json()).toMatchObject({ error: "csrf_invalid" });
+      const seededDashboard = await fetch(`${base}/dashboard/sample-data`, {
+        method: "POST",
+        headers: authHeaders(auth),
+        body: JSON.stringify({}),
+      }).then((res) => {
+        expect(res.status).toBe(201);
+        return res.json();
+      });
+      expect(seededDashboard.seeded).toBe(true);
+      expect(seededDashboard.dashboard.sample_data.seeded).toBe(true);
+      const removedDashboard = await fetch(`${base}/dashboard/sample-data`, {
+        method: "DELETE",
+        headers: authHeaders(auth),
+      }).then((res) => {
+        expect(res.status).toBe(200);
+        return res.json();
+      });
+      expect(removedDashboard.removed).toBe(true);
+      expect(removedDashboard.dashboard.sample_data.seeded).toBe(false);
+      const unauth = await fetch(`${base}/estimates/nope/pdf`);
+      expect(unauth.status).toBe(401);
+      expect(unauth.headers.get("cache-control")).toBe("no-store, private");
+      expect(unauth.headers.get("vary")).toBe("Cookie");
+
+      const cust = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers: authHeaders(auth),
+        body: JSON.stringify({ contact_name: "PDF Customer", billing_address: address }),
+      }).then((res) => res.json());
+      const estimate = await fetch(`${base}/estimates`, {
+        method: "POST",
+        headers: authHeaders(auth),
+        body: JSON.stringify({ title: "Test Order", customer_id: cust.id, items: [item()] }),
+      }).then((res) => res.json());
+      const pdf = await fetch(`${base}/estimates/${estimate.id}/pdf`, {
+        headers: { Cookie: auth.cookie },
+      });
+      expect(pdf.status).toBe(200);
+      expect(pdf.headers.get("cache-control")).toBe("no-store, private");
+      expect(pdf.headers.get("vary")).toBe("Cookie");
+      expect(pdf.headers.get("content-type")).toBe("application/pdf");
+      expect(pdf.headers.get("content-disposition")).toContain(`quote-${estimate.estimate_number}.pdf`);
+      expect(pdf.headers.get("content-disposition")).not.toContain("estimate");
+    });
+  });
+
+  it("enforces tenant isolation and logout revocation at route level", async () => {
+    await withServer(async (base) => {
+      const a = await registerHttpSession(base, {
+        tenant_name: "A",
+        tenant_slug: "a",
+        owner_name: "A",
+        owner_email: "a@example.com",
+        owner_password: "password123",
+      });
+      const b = await registerHttpSession(base, {
+        tenant_name: "B",
+        tenant_slug: "b",
+        owner_name: "B",
+        owner_email: "b@example.com",
+        owner_password: "password123",
+      });
+      const cust = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers: authHeaders(a),
+        body: JSON.stringify({ contact_name: "Tenant A", billing_address: address }),
+      }).then((res) => res.json());
+      const crossTenant = await fetch(`${base}/customers/${cust.id}`, { headers: { Cookie: b.cookie } });
+      expect(crossTenant.status).toBe(404);
+      const logout = await fetch(`${base}/auth/logout`, { method: "POST", headers: authHeaders(a, false) });
+      expect(logout.status).toBe(200);
+      expect(logout.headers.get("set-cookie")).toContain("Max-Age=0");
+      const me = await fetch(`${base}/auth/me`, { headers: { Cookie: a.cookie } });
+      expect(me.status).toBe(401);
+      const repeatedLogout = await fetch(`${base}/auth/logout`, { method: "POST", headers: { Cookie: a.cookie } });
+      expect(repeatedLogout.status).toBe(200);
+      expect(repeatedLogout.headers.get("set-cookie")).toContain("Max-Age=0");
+
+      const crossSiteLogout = await fetch(`${base}/auth/logout`, {
+        method: "POST",
+        headers: { Origin: "https://evil.example", "Sec-Fetch-Site": "cross-site" },
+      });
+      expect(crossSiteLogout.status).toBe(403);
+      expect(crossSiteLogout.headers.get("set-cookie")).toBeNull();
+      expect(await crossSiteLogout.json()).toMatchObject({ error: "origin_not_allowed" });
+    });
+  });
+
+  it("rejects cross-site auth-cookie issuance before login or registration sets a session", async () => {
+    const previousAllowedOrigins = process.env.SIGNGUY_SLIM_ALLOWED_ORIGINS;
+    await withServer(async (base) => {
+      const origin = new URL(base).origin;
+      const crossRegister = await fetch(`${base}/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain", Origin: "https://evil.example" },
+        body: JSON.stringify({
+          tenant_name: "Cross Site Shop",
+          tenant_slug: "cross-site-shop",
+          owner_name: "Owner",
+          owner_email: "cross-site@example.com",
+          owner_password: "password123",
+        }),
+      });
+      expect(crossRegister.status).toBe(403);
+      expect(crossRegister.headers.get("set-cookie")).toBeNull();
+      expect(await crossRegister.json()).toMatchObject({ error: "origin_not_allowed" });
+
+      const fetchMetadataRegister = await fetch(`${base}/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Sec-Fetch-Site": "cross-site" },
+        body: JSON.stringify({
+          tenant_name: "Fetch Metadata Shop",
+          tenant_slug: "fetch-metadata-shop",
+          owner_name: "Owner",
+          owner_email: "fetch-metadata@example.com",
+          owner_password: "password123",
+        }),
+      });
+      expect(fetchMetadataRegister.status).toBe(403);
+      expect(await fetchMetadataRegister.json()).toMatchObject({ error: "origin_not_allowed" });
+
+      const sameOrigin = await registerHttpSession(base, {
+        tenant_name: "Same Origin Shop",
+        tenant_slug: "same-origin-shop",
+        owner_name: "Owner",
+        owner_email: "same-origin@example.com",
+        owner_password: "password123",
+      }, { Origin: origin, "Sec-Fetch-Site": "same-origin" });
+      expect(sameOrigin.response.status).toBe(201);
+      expect(sameOrigin.response.headers.get("set-cookie")).toContain("signguy_slim_session=");
+
+      const crossLogin = await loginHttpSession(base, {
+        tenant_slug: "same-origin-shop",
+        email: "same-origin@example.com",
+        password: "password123",
+      }, { Origin: "https://evil.example" });
+      expect(crossLogin.response.status).toBe(403);
+      expect(crossLogin.response.headers.get("set-cookie")).toBeNull();
+      expect(crossLogin.session).toMatchObject({ error: "origin_not_allowed" });
+
+      try {
+        process.env.SIGNGUY_SLIM_ALLOWED_ORIGINS = "https://app.example";
+        const allowedSplitOrigin = await registerHttpSession(base, {
+          tenant_name: "Allowed Split Shop",
+          tenant_slug: "allowed-split-shop",
+          owner_name: "Owner",
+          owner_email: "allowed-split@example.com",
+          owner_password: "password123",
+        }, { Origin: "https://app.example", "Sec-Fetch-Site": "cross-site" });
+        expect(allowedSplitOrigin.response.status).toBe(201);
+        expect(allowedSplitOrigin.response.headers.get("set-cookie")).toContain("signguy_slim_session=");
+      } finally {
+        if (previousAllowedOrigins === undefined) delete process.env.SIGNGUY_SLIM_ALLOWED_ORIGINS;
+        else process.env.SIGNGUY_SLIM_ALLOWED_ORIGINS = previousAllowedOrigins;
+      }
+    });
+  });
+
+  it("rate limits registration by trusted client address and ignores spoofed forwarding headers", async () => {
+    expect(process.env.SIGNGUY_SLIM_TRUST_PROXY).toBeUndefined();
+    process.env.SIGNGUY_SLIM_RATE_LIMIT_REGISTER_IP_LIMIT = "1";
+    process.env.SIGNGUY_SLIM_RATE_LIMIT_REGISTER_IP_WINDOW_SECONDS = "60";
+    await withServer(async (base) => {
+      const first = await registerHttpSession(base, {
+        tenant_name: "Limiter One",
+        tenant_slug: "limiter-one",
+        owner_name: "Owner",
+        owner_email: "limiter-one@example.com",
+        owner_password: "password123",
+      }, { "X-Forwarded-For": "198.51.100.10" });
+      expect(first.response.status).toBe(201);
+
+      const second = await registerHttpSession(base, {
+        tenant_name: "Limiter Two",
+        tenant_slug: "limiter-two",
+        owner_name: "Owner",
+        owner_email: "limiter-two@example.com",
+        owner_password: "password123",
+      }, { "X-Forwarded-For": "198.51.100.11" });
+      expect(second.response.status).toBe(429);
+      expect(second.response.headers.get("retry-after")).toBeTruthy();
+      expect(second.session).toMatchObject({ error: "rate_limit_exceeded" });
+    });
+  });
+
+  it("charges public IP limits before parsing malformed auth request bodies", async () => {
+    process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT = "1";
+    process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_WINDOW_SECONDS = "60";
+    await withServer(async (base, httpDb) => {
+      const first = await fetch(`${base}/auth/login`, { method: "POST", body: "{" });
+      expect(first.status).toBe(400);
+      expect(await first.json()).toMatchObject({ error: "malformed_json" });
+
+      const second = await fetch(`${base}/auth/login`, { method: "POST", body: "{" });
+      expect(second.status).toBe(429);
+      expect(await second.json()).toMatchObject({ error: "rate_limit_exceeded" });
+      expect(httpDb.prepare("SELECT attempt_count FROM rate_limit_buckets WHERE scope = 'login_ip'").get().attempt_count).toBe(2);
+    });
+  });
+
+  it("uses the trusted proxy hop instead of caller-supplied forwarded prefixes", async () => {
+    const previousTrustProxy = process.env.SIGNGUY_SLIM_TRUST_PROXY;
+    const previousHops = process.env.SIGNGUY_SLIM_TRUST_PROXY_HOPS;
+    try {
+      process.env.SIGNGUY_SLIM_TRUST_PROXY = "1";
+      process.env.SIGNGUY_SLIM_TRUST_PROXY_HOPS = "1";
+      process.env.SIGNGUY_SLIM_RATE_LIMIT_REGISTER_IP_LIMIT = "1";
+      process.env.SIGNGUY_SLIM_RATE_LIMIT_REGISTER_IP_WINDOW_SECONDS = "60";
+      await withServer(async (base) => {
+        const first = await registerHttpSession(base, {
+          tenant_name: "Trusted Hop One",
+          tenant_slug: "trusted-hop-one",
+          owner_name: "Owner",
+          owner_email: "trusted-hop-one@example.com",
+          owner_password: "password123",
+        }, { "X-Forwarded-For": "198.51.100.250, 203.0.113.44" });
+        expect(first.response.status).toBe(201);
+
+        const second = await registerHttpSession(base, {
+          tenant_name: "Trusted Hop Two",
+          tenant_slug: "trusted-hop-two",
+          owner_name: "Owner",
+          owner_email: "trusted-hop-two@example.com",
+          owner_password: "password123",
+        }, { "X-Forwarded-For": "198.51.100.251, 203.0.113.44" });
+        expect(second.response.status).toBe(429);
+        expect(second.session).toMatchObject({ error: "rate_limit_exceeded" });
+      });
+    } finally {
+      if (previousTrustProxy === undefined) delete process.env.SIGNGUY_SLIM_TRUST_PROXY;
+      else process.env.SIGNGUY_SLIM_TRUST_PROXY = previousTrustProxy;
+      if (previousHops === undefined) delete process.env.SIGNGUY_SLIM_TRUST_PROXY_HOPS;
+      else process.env.SIGNGUY_SLIM_TRUST_PROXY_HOPS = previousHops;
+    }
+  });
+
+  it("rejects explicitly invalid production account-control environment values", () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousQuota = process.env.SIGNGUY_SLIM_DEFAULT_TENANT_STORAGE_QUOTA_BYTES;
+    const previousLoginLimit = process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT;
+    try {
+      process.env.NODE_ENV = "production";
+      process.env.SIGNGUY_SLIM_DEFAULT_TENANT_STORAGE_QUOTA_BYTES = "not-a-number";
+      expect(() => defaultTenantStorageQuotaBytes()).toThrow("signguy_slim_default_tenant_storage_quota_bytes_invalid");
+      process.env.SIGNGUY_SLIM_DEFAULT_TENANT_STORAGE_QUOTA_BYTES = "1073741824";
+      process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT = "0";
+      expect(() => rateLimitPolicy("login_ip")).toThrow("signguy_slim_rate_limit_login_ip_limit_invalid");
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousQuota === undefined) delete process.env.SIGNGUY_SLIM_DEFAULT_TENANT_STORAGE_QUOTA_BYTES;
+      else process.env.SIGNGUY_SLIM_DEFAULT_TENANT_STORAGE_QUOTA_BYTES = previousQuota;
+      if (previousLoginLimit === undefined) delete process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT;
+      else process.env.SIGNGUY_SLIM_RATE_LIMIT_LOGIN_IP_LIMIT = previousLoginLimit;
+    }
+  });
+
+  it("requires CSRF for authenticated unsafe requests and rejects legacy bearer headers", async () => {
+    await withServer(async (base) => {
+      const auth = await registerHttpSession(base, {
+        tenant_name: "CSRF Shop",
+        tenant_slug: "csrf-shop",
+        owner_name: "Owner",
+        owner_email: "csrf@example.com",
+        owner_password: "password123",
+      });
+      const me = await fetch(`${base}/auth/me`, { headers: { Cookie: auth.cookie } });
+      expect(me.status).toBe(200);
+      expect((await me.json()).csrf_token).toBe(auth.session.csrf_token);
+
+      const bearerOnly = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer legacy-token" },
+        body: JSON.stringify({ contact_name: "Bearer Customer", billing_address: address }),
+      });
+      expect(bearerOnly.status).toBe(401);
+
+      const missing = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: auth.cookie },
+        body: JSON.stringify({ contact_name: "Missing CSRF", billing_address: address }),
+      });
+      expect(missing.status).toBe(403);
+      expect(await missing.json()).toMatchObject({ error: "csrf_invalid" });
+
+      const bad = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: auth.cookie, "X-CSRF-Token": "bad-csrf" },
+        body: JSON.stringify({ contact_name: "Bad CSRF", billing_address: address }),
+      });
+      expect(bad.status).toBe(403);
+      expect(await bad.json()).toMatchObject({ error: "csrf_invalid" });
+
+      const other = await registerHttpSession(base, {
+        tenant_name: "Other CSRF Shop",
+        tenant_slug: "other-csrf-shop",
+        owner_name: "Owner",
+        owner_email: "other-csrf@example.com",
+        owner_password: "password123",
+      });
+      const swapped = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: auth.cookie, "X-CSRF-Token": other.session.csrf_token },
+        body: JSON.stringify({ contact_name: "Swapped CSRF", billing_address: address }),
+      });
+      expect(swapped.status).toBe(403);
+      expect(await swapped.json()).toMatchObject({ error: "csrf_invalid" });
+    });
+  });
+
+  it("blocks cross-site GET requests to read-marking employee portal endpoints", async () => {
+    await withServer(async (base) => {
+      const auth = await registerHttpSession(base, {
+        tenant_name: "Read State Shop",
+        tenant_slug: "read-state-shop",
+        owner_name: "Owner",
+        owner_email: "read-state@example.com",
+        owner_password: "password123",
+      });
+      const announcement = await fetch(`${base}/employee-portal/announcements/announcement-1`, {
+        headers: { Cookie: auth.cookie, "Sec-Fetch-Site": "cross-site" },
+      });
+      expect(announcement.status).toBe(403);
+      expect(await announcement.json()).toMatchObject({ error: "origin_not_allowed" });
+      const message = await fetch(`${base}/employee-portal/messages/user-2`, {
+        headers: { Cookie: auth.cookie, Origin: "https://evil.example" },
+      });
+      expect(message.status).toBe(403);
+      expect(await message.json()).toMatchObject({ error: "origin_not_allowed" });
+    });
+  });
+
+  it("sets Secure cookies only for production or HTTPS-aware requests", async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousCookieSecure = process.env.SIGNGUY_SLIM_COOKIE_SECURE;
+    const previousTrustProxy = process.env.SIGNGUY_SLIM_TRUST_PROXY;
+    const previousPublicRegistration = process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+    try {
+      delete process.env.NODE_ENV;
+      delete process.env.SIGNGUY_SLIM_COOKIE_SECURE;
+      delete process.env.SIGNGUY_SLIM_TRUST_PROXY;
+      await withServer(async (base) => {
+        const spoofed = await registerHttpSession(base, {
+          tenant_name: "Spoofed Proxy Shop",
+          tenant_slug: "spoofed-proxy-shop",
+          owner_name: "Owner",
+          owner_email: "spoofed-proxy@example.com",
+          owner_password: "password123",
+        }, { "X-Forwarded-Proto": "https" });
+        expect(spoofed.response.headers.get("set-cookie")).not.toContain("Secure");
+      });
+
+      process.env.SIGNGUY_SLIM_TRUST_PROXY = "1";
+      await withServer(async (base) => {
+        const trustedProxy = await registerHttpSession(base, {
+          tenant_name: "Trusted Proxy Shop",
+          tenant_slug: "trusted-proxy-shop",
+          owner_name: "Owner",
+          owner_email: "trusted-proxy@example.com",
+          owner_password: "password123",
+        }, { "X-Forwarded-Proto": "http, https" });
+        expect(trustedProxy.response.headers.get("set-cookie")).toContain("Secure");
+        expect(trustedProxy.response.headers.get("set-cookie")).toContain("__Host-signguy_slim_session=");
+      });
+
+      delete process.env.SIGNGUY_SLIM_TRUST_PROXY;
+      process.env.SIGNGUY_SLIM_COOKIE_SECURE = "1";
+      await withServer(async (base) => {
+        const forced = await registerHttpSession(base, {
+          tenant_name: "Forced Secure Shop",
+          tenant_slug: "forced-secure-shop",
+          owner_name: "Owner",
+          owner_email: "forced-secure@example.com",
+          owner_password: "password123",
+        });
+        expect(forced.response.headers.get("set-cookie")).toContain("Secure");
+        expect(forced.response.headers.get("set-cookie")).toContain("__Host-signguy_slim_session=");
+      });
+
+      delete process.env.SIGNGUY_SLIM_COOKIE_SECURE;
+      process.env.NODE_ENV = "production";
+      process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED = "1";
+      await withServer(async (base) => {
+        const auth = await registerHttpSession(base, {
+          tenant_name: "Secure Shop",
+          tenant_slug: "secure-shop",
+          owner_name: "Owner",
+          owner_email: "secure@example.com",
+          owner_password: "password123",
+        });
+        expect(auth.response.headers.get("set-cookie")).toContain("Secure");
+        expect(auth.response.headers.get("set-cookie")).toContain("__Host-signguy_slim_session=");
+      });
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousCookieSecure === undefined) delete process.env.SIGNGUY_SLIM_COOKIE_SECURE;
+      else process.env.SIGNGUY_SLIM_COOKIE_SECURE = previousCookieSecure;
+      if (previousTrustProxy === undefined) delete process.env.SIGNGUY_SLIM_TRUST_PROXY;
+      else process.env.SIGNGUY_SLIM_TRUST_PROXY = previousTrustProxy;
+      if (previousPublicRegistration === undefined) delete process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED;
+      else process.env.SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED = previousPublicRegistration;
+    }
+  });
+
+  it("keeps session cookies opaque during fixation, duplicate-cookie, expiry, and multi-session flows", async () => {
+    await withServer(async (base, httpDb) => {
+      const auth = await registerHttpSession(base, {
+        tenant_name: "Session Shop",
+        tenant_slug: "session-shop",
+        owner_name: "Owner",
+        owner_email: "session@example.com",
+        owner_password: "password123",
+      }, { Cookie: "signguy_slim_session=attacker-fixed" });
+      expect(cookieValue(auth.cookie)).not.toBe("attacker-fixed");
+
+      const loginA = await loginHttpSession(base, {
+        tenant_slug: "session-shop",
+        email: "session@example.com",
+        password: "password123",
+      });
+      const loginB = await loginHttpSession(base, {
+        tenant_slug: "session-shop",
+        email: "session@example.com",
+        password: "password123",
+      });
+      expect(cookieValue(loginA.cookie)).not.toBe(cookieValue(loginB.cookie));
+      expect(loginA.session.csrf_token).not.toBe(loginB.session.csrf_token);
+
+      const duplicateValidFirst = await fetch(`${base}/auth/me`, {
+        headers: { Cookie: `${loginA.cookie}; signguy_slim_session=attacker-fixed` },
+      });
+      expect(duplicateValidFirst.status).toBe(200);
+      const duplicateInvalidFirst = await fetch(`${base}/auth/me`, {
+        headers: { Cookie: `signguy_slim_session=attacker-fixed; ${loginA.cookie}` },
+      });
+      expect(duplicateInvalidFirst.status).toBe(401);
+
+      const swappedCsrf = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: loginB.cookie, "X-CSRF-Token": loginA.session.csrf_token },
+        body: JSON.stringify({ contact_name: "Wrong CSRF Session", billing_address: address }),
+      });
+      expect(swappedCsrf.status).toBe(403);
+      expect(await swappedCsrf.json()).toMatchObject({ error: "csrf_invalid" });
+
+      const logoutA = await fetch(`${base}/auth/logout`, { method: "POST", headers: authHeaders(loginA, false) });
+      expect(logoutA.status).toBe(200);
+      const meA = await fetch(`${base}/auth/me`, { headers: { Cookie: loginA.cookie } });
+      expect(meA.status).toBe(401);
+      const meB = await fetch(`${base}/auth/me`, { headers: { Cookie: loginB.cookie } });
+      expect(meB.status).toBe(200);
+
+      httpDb
+        .prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
+        .run("2000-01-01T00:00:00.000Z", hashToken(cookieValue(loginB.cookie)));
+      const expired = await fetch(`${base}/auth/me`, { headers: { Cookie: loginB.cookie } });
+      expect(expired.status).toBe(401);
+      const expiredLogout = await fetch(`${base}/auth/logout`, { method: "POST", headers: { Cookie: loginB.cookie } });
+      expect(expiredLogout.status).toBe(200);
+      expect(expiredLogout.headers.get("set-cookie")).toContain("Max-Age=0");
+    });
+  });
+
+  it("exposes Release B operator recovery while keeping quota host-managed at route level", async () => {
+    await withServer(async (base, httpDb) => {
+      const auth = await registerHttpSession(base, {
+        tenant_name: "Recovery Shop",
+        tenant_slug: "recovery-shop",
+        owner_name: "Owner",
+        owner_email: "recovery@example.com",
+        owner_password: "password123",
+      });
+      const quotaBefore = httpDb.prepare("SELECT storage_quota_bytes FROM tenants WHERE id = ?").get(auth.session.user.tenant_id).storage_quota_bytes;
+      const quota = await fetch(`${base}/settings/storage-quota`, {
+        method: "PATCH",
+        headers: authHeaders(auth),
+        body: JSON.stringify({ storage_quota_bytes: 1024 * 1024 * 1024 }),
+      });
+      expect(quota.status).toBe(403);
+      expect(await quota.json()).toMatchObject({ error: "storage_quota_host_managed" });
+      expect(httpDb.prepare("SELECT storage_quota_bytes FROM tenants WHERE id = ?").get(auth.session.user.tenant_id).storage_quota_bytes).toBe(quotaBefore);
+
+      const reset = await fetch(`${base}/users/${auth.session.user.id}/password-reset`, {
+        method: "POST",
+        headers: authHeaders(auth),
+        body: JSON.stringify({ send_email: false }),
+      });
+      expect(reset.status).toBe(201);
+      const body = await reset.json();
+      expect(body.reset_token).toBeTruthy();
+      expect(body.reset_url).toContain("/#/reset-password?token=");
+    });
+  });
+
+  it("rate limits invitation and operator reset link issuance", async () => {
+    const previousInvitationLimit = process.env.SIGNGUY_SLIM_RATE_LIMIT_ONBOARDING_INVITATION_LIMIT;
+    const previousResetLimit = process.env.SIGNGUY_SLIM_RATE_LIMIT_OPERATOR_PASSWORD_RESET_LIMIT;
+    try {
+      process.env.SIGNGUY_SLIM_RATE_LIMIT_ONBOARDING_INVITATION_LIMIT = "2";
+      process.env.SIGNGUY_SLIM_RATE_LIMIT_OPERATOR_PASSWORD_RESET_LIMIT = "1";
+      await withServer(async (base) => {
+        const auth = await registerHttpSession(base, {
+          tenant_name: "Limiter Shop",
+          tenant_slug: "limiter-shop",
+          owner_name: "Owner",
+          owner_email: "limiter@example.com",
+          owner_password: "password123",
+        });
+
+        const invite = await fetch(`${base}/onboarding/invitations`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: JSON.stringify({ email: "invite@example.com" }),
+        });
+        expect(invite.status).toBe(201);
+        const inviteBody = await invite.json();
+        const listed = await fetch(`${base}/onboarding/invitations`, { headers: { Cookie: auth.cookie } });
+        expect(listed.status).toBe(200);
+        const listedBody = await listed.json();
+        expect(JSON.stringify(listedBody)).not.toContain(inviteBody.invite_token);
+        expect(listedBody.items[0]).toMatchObject({ id: inviteBody.id, email: "invite@example.com", revoked_at: null });
+        const revoked = await fetch(`${base}/onboarding/invitations/${inviteBody.id}/revoke`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: "{}",
+        });
+        expect(revoked.status).toBe(200);
+        const revokeAgain = await fetch(`${base}/onboarding/invitations/${inviteBody.id}/revoke`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: "{}",
+        });
+        expect(revokeAgain.status).toBe(200);
+        const consumedInvite = await fetch(`${base}/onboarding/invitations`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: JSON.stringify({ email: "consume@example.com" }),
+        });
+        expect(consumedInvite.status).toBe(201);
+        const consumedInviteBody = await consumedInvite.json();
+        await fetch(`${base}/auth/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tenant_name: "Consumed Invite Shop",
+            tenant_slug: "consumed-invite-shop",
+            owner_name: "Owner",
+            owner_email: "consume@example.com",
+            owner_password: "password123",
+            invite_token: consumedInviteBody.invite_token,
+          }),
+        });
+        const revokeConsumed = await fetch(`${base}/onboarding/invitations/${consumedInviteBody.id}/revoke`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: "{}",
+        });
+        expect(revokeConsumed.status).toBe(409);
+        expect(await revokeConsumed.json()).toMatchObject({ error: "signup_invitation_already_used" });
+        const revokeMissing = await fetch(`${base}/onboarding/invitations/missing-invite/revoke`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: "{}",
+        });
+        expect(revokeMissing.status).toBe(404);
+        expect(await revokeMissing.json()).toMatchObject({ error: "signup_invitation_not_found" });
+        const inviteBlocked = await fetch(`${base}/onboarding/invitations`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: JSON.stringify({ email: "invite2@example.com" }),
+        });
+        expect(inviteBlocked.status).toBe(429);
+        expect(inviteBlocked.headers.get("retry-after")).toBeTruthy();
+
+        const reset = await fetch(`${base}/users/${auth.session.user.id}/password-reset`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: JSON.stringify({ send_email: false }),
+        });
+        expect(reset.status).toBe(201);
+        const staff = await fetch(`${base}/users`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: JSON.stringify({ display_name: "Reset Target", email: "reset-target@example.com", password: "password123", role: "staff" }),
+        });
+        expect(staff.status).toBe(201);
+        const staffBody = await staff.json();
+        const resetBlocked = await fetch(`${base}/users/${staffBody.id}/password-reset`, {
+          method: "POST",
+          headers: authHeaders(auth),
+          body: JSON.stringify({ send_email: false }),
+        });
+        expect(resetBlocked.status).toBe(429);
+      });
+    } finally {
+      if (previousInvitationLimit === undefined) delete process.env.SIGNGUY_SLIM_RATE_LIMIT_ONBOARDING_INVITATION_LIMIT;
+      else process.env.SIGNGUY_SLIM_RATE_LIMIT_ONBOARDING_INVITATION_LIMIT = previousInvitationLimit;
+      if (previousResetLimit === undefined) delete process.env.SIGNGUY_SLIM_RATE_LIMIT_OPERATOR_PASSWORD_RESET_LIMIT;
+      else process.env.SIGNGUY_SLIM_RATE_LIMIT_OPERATOR_PASSWORD_RESET_LIMIT = previousResetLimit;
+    }
+  });
+
+  it("returns one invoice for concurrent Create/Open Invoice requests", async () => {
+    await withServer(async (base) => {
+      const auth = await registerHttpSession(base, {
+        tenant_name: "Race Shop",
+        tenant_slug: "race-shop",
+        owner_name: "Owner",
+        owner_email: "race@example.com",
+        owner_password: "password123",
+      });
+      const headers = authHeaders(auth);
+      const cust = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ contact_name: "Race Customer", billing_address: address }),
+      }).then((res) => res.json());
+      const order = await fetch(`${base}/orders`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ title: "Test Order", customer_id: cust.id, items: [item()] }),
+      }).then((res) => res.json());
+      const [first, second] = await Promise.all([
+        fetch(`${base}/orders/${order.id}/invoice`, { method: "POST", headers, body: "{}" }).then((res) => res.json()),
+        fetch(`${base}/orders/${order.id}/invoice`, { method: "POST", headers, body: "{}" }).then((res) => res.json()),
+      ]);
+      expect(first.invoice.id).toBe(second.invoice.id);
+      expect([first.already_exists, second.already_exists].sort()).toEqual([false, true]);
+    });
+  });
+
+  it("streams multipart uploads and rejects malformed multipart cleanly", async () => {
+    await withServer(async (base) => {
+      const auth = await registerHttpSession(base, {
+        tenant_name: "Upload Shop",
+        tenant_slug: "upload-shop",
+        owner_name: "Owner",
+        owner_email: "upload@example.com",
+        owner_password: "password123",
+      });
+      const headers = authHeaders(auth);
+      const cust = await fetch(`${base}/customers`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ contact_name: "Upload Customer", billing_address: address }),
+      }).then((res) => res.json());
+      const order = await fetch(`${base}/orders`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ title: "Test Order", customer_id: cust.id, items: [item()] }),
+      }).then((res) => res.json());
+      const form = new FormData();
+      form.append("file", new Blob(["proof"], { type: "text/plain" }), "proof.txt");
+      const uploaded = await fetch(`${base}/orders/${order.id}/attachments`, {
+        method: "POST",
+        headers: authHeaders(auth, false),
+        body: form,
+      });
+      expect(uploaded.status).toBe(201);
+      expect((await uploaded.json()).sha256).toBe(createHash("sha256").update("proof").digest("hex"));
+      const missingCsrfForm = new FormData();
+      missingCsrfForm.append("file", new Blob(["proof"], { type: "text/plain" }), "proof.txt");
+      const missingCsrf = await fetch(`${base}/orders/${order.id}/attachments`, {
+        method: "POST",
+        headers: { Cookie: auth.cookie },
+        body: missingCsrfForm,
+      });
+      expect(missingCsrf.status).toBe(403);
+      expect(await missingCsrf.json()).toMatchObject({ error: "csrf_invalid" });
+      const malformed = await fetch(`${base}/orders/${order.id}/attachments`, {
+        method: "POST",
+        headers: { Cookie: auth.cookie, "X-CSRF-Token": auth.session.csrf_token, "Content-Type": "multipart/form-data; boundary=bad" },
+        body: "--bad\r\nbroken",
+      });
+      expect(malformed.status).toBe(400);
+      expect(["malformed_multipart", "attachment_empty"]).toContain((await malformed.json()).error);
+
+      const backupForm = new FormData();
+      backupForm.append("file", new Blob(["not-a-backup"], { type: "application/octet-stream" }), "backup.sgb");
+      backupForm.append("passphrase", "password123");
+      const missingBackupCsrf = await fetch(`${base}/backup/preview`, {
+        method: "POST",
+        headers: { Cookie: auth.cookie },
+        body: backupForm,
+      });
+      expect(missingBackupCsrf.status).toBe(403);
+      expect(await missingBackupCsrf.json()).toMatchObject({ error: "csrf_invalid" });
+    });
+  });
+});
+
+describe("streaming multipart parser resilience", () => {
+  let tempRoot;
+
+  beforeEach(() => {
+    tempRoot = mkdtempSync(join(tmpdir(), "signguy-slim-parser-test-"));
+  });
+
+  afterEach(() => {
+    if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    delete process.env.SIGNGUY_SLIM_UPLOAD_LIMIT_BYTES;
+  });
+
+  it("rejects missing multipart boundary without creating temp upload directories", async () => {
+    const req = new PassThrough();
+    req.headers = { "content-type": "multipart/form-data" };
+
+    await expect(withTimeout(readMultipartFile(req, { tempRoot }))).rejects.toMatchObject({ message: "malformed_multipart", status: 400 });
+    expect(tempUploadDirs(tempRoot)).toEqual([]);
+  });
+
+  it("rejects aborted multipart requests and removes temp directories", async () => {
+    const req = new PassThrough();
+    req.headers = { "content-type": "multipart/form-data; boundary=test-boundary" };
+    const promise = withTimeout(readMultipartFile(req, { tempRoot }));
+    req.write("--test-boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"proof.txt\"\r\nContent-Type: text/plain\r\n\r\npartial");
+    req.emit("aborted");
+
+    await expect(promise).rejects.toMatchObject({ message: "malformed_multipart", status: 400 });
+    expect(tempUploadDirs(tempRoot)).toEqual([]);
+  });
+
+  it("rejects request stream errors and removes temp directories", async () => {
+    const req = new PassThrough();
+    req.headers = { "content-type": "multipart/form-data; boundary=test-boundary" };
+    const promise = withTimeout(readMultipartFile(req, { tempRoot }));
+    req.emit("error", new Error("socket failed"));
+
+    await expect(promise).rejects.toMatchObject({ message: "malformed_multipart", status: 400 });
+    expect(tempUploadDirs(tempRoot)).toEqual([]);
+  });
+
+  it("rejects oversized files with 413 and removes temp directories", async () => {
+    process.env.SIGNGUY_SLIM_UPLOAD_LIMIT_BYTES = "4";
+    const req = multipartRequest(multipartBody("too-large"), {});
+
+    await expect(withTimeout(readMultipartFile(req, { tempRoot }))).rejects.toMatchObject({ message: "attachment_too_large", status: 413 });
+    expect(tempUploadDirs(tempRoot)).toEqual([]);
+  });
+
+  it("rejects output stream failures and removes temp directories", async () => {
+    const req = multipartRequest(multipartBody("proof"), {});
+    const failingWriter = () => new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(new Error("disk failed"));
+      },
+    });
+
+    await expect(withTimeout(readMultipartFile(req, { tempRoot, createWriteStreamImpl: failingWriter }))).rejects.toMatchObject({ message: "malformed_multipart", status: 400 });
+    expect(tempUploadDirs(tempRoot)).toEqual([]);
+  });
+});
+
+describe("Version 1 Part 3 order workspace and production", () => {
+  it("loads workspace data, includes timestamps, enforces tenant isolation, and rejects stale saves", async () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const workspace = service.orderWorkspace(owner, order.id);
+    expect(workspace.customer.contact_name).toBe("Jane Customer");
+    expect(workspace.order.created_at).toBeTruthy();
+    expect(workspace.order.updated_at).toBe(order.updated_at);
+    expect(workspace.order.production_progress).toEqual({ completed: 0, total: 1, percent: 0 });
+    const other = await bootstrap("shop-b");
+    expect(() => service.orderWorkspace(other.user, order.id)).toThrow("order_not_found");
+    expect(() => service.updateOrderWorkspace(owner, order.id, { expected_updated_at: "stale", internal_notes: "stale" })).toThrow("order_conflict");
+    expect(() => service.updateOrderWorkspace(owner, order.id, { internal_notes: "missing expected timestamp" })).toThrow();
+  });
+
+  it("saves order and item edits transactionally, advances real timestamps, and recalculates totals", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, discount_cents: 100, items: [item(), item({ description: "Install", taxable: false })] });
+    const originalItems = order.items.map((entry) => ({ id: entry.id, portable_id: entry.portable_id, source_estimate_item_id: entry.source_estimate_item_id, created_at: entry.created_at }));
+    const updated = service.updateOrderWorkspace(owner, order.id, {
+      expected_updated_at: order.updated_at,
+      discount_cents: 200,
+      items: [
+        { ...order.items[1], position: undefined, quantity_decimal: "3", unit_price_cents: 1000, production_stage: "ready", completed: false },
+        { ...order.items[0], description: "Banner edited", production_stage: "in_progress", completed: false },
+      ],
+    }).order;
+    expect(updated.items.map((entry) => entry.description)).toEqual(["Install", "Banner edited"]);
+    expect(updated.subtotal_cents).toBe(6000);
+    expect(updated.discount_cents).toBe(200);
+    expect(Date.parse(updated.updated_at)).toBeGreaterThan(Date.parse(order.updated_at));
+    expect(updated.items.map((entry) => entry.id)).toEqual([originalItems[1].id, originalItems[0].id]);
+    expect(updated.items.map((entry) => entry.portable_id)).toEqual([originalItems[1].portable_id, originalItems[0].portable_id]);
+    expect(updated.items.map((entry) => entry.created_at)).toEqual([originalItems[1].created_at, originalItems[0].created_at]);
+    const originalUpdate = service.updateOrderItemsDifferential;
+    service.updateOrderItemsDifferential = () => {
+      throw new Error("forced_item_failure");
+    };
+    expect(() => service.updateOrderWorkspace(owner, updated.id, { expected_updated_at: updated.updated_at, items: [{ ...updated.items[0], description: "Nope" }] })).toThrow("forced_item_failure");
+    service.updateOrderItemsDifferential = originalUpdate;
+    expect(service.order(owner, updated.id).items[0].description).toBe("Install");
+  });
+
+  it("preserves converted Estimate item links and portable IDs after editing and reordering", () => {
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, { title: "Test Order", customer_id: c.id, items: [item({ description: "First" }), item({ description: "Second" })] });
+    const order = service.convertEstimate(owner, estimate.id).order;
+    const before = order.items.map((entry) => ({ id: entry.id, portable_id: entry.portable_id, source_estimate_item_id: entry.source_estimate_item_id, created_at: entry.created_at }));
+    const saved = service.updateOrderWorkspace(owner, order.id, {
+      expected_updated_at: order.updated_at,
+      items: [
+        { ...order.items[1], description: "Second edited", production_stage: "ready", completed: false },
+        { ...order.items[0], production_stage: "not_started", completed: false },
+      ],
+    }).order;
+    expect(saved.items.map((entry) => entry.id)).toEqual([before[1].id, before[0].id]);
+    expect(saved.items.map((entry) => entry.portable_id)).toEqual([before[1].portable_id, before[0].portable_id]);
+    expect(saved.items.map((entry) => entry.source_estimate_item_id)).toEqual([estimate.items[1].id, estimate.items[0].id]);
+    expect(saved.items.map((entry) => entry.created_at)).toEqual([before[1].created_at, before[0].created_at]);
+  });
+
+  it("adds, duplicates, removes, edits, and reorders Order items without accepting client-selected new IDs", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item({ description: "Keep" }), item({ description: "Remove" })] });
+    expect(() => service.updateOrderWorkspace(owner, order.id, {
+      expected_updated_at: order.updated_at,
+      items: [{ ...order.items[0] }, { ...item({ id: "client-picked-id", description: "Invalid new ID" }), production_stage: "not_started", completed: false }],
+    })).toThrow("order_item_not_found");
+    const saved = service.updateOrderWorkspace(owner, order.id, {
+      expected_updated_at: order.updated_at,
+      items: [
+        { ...order.items[0], description: "Keep edited", production_stage: "ready", completed: false },
+        { ...item({ description: "Added" }), production_stage: "not_started", completed: false },
+        { ...item({ description: "Duplicate" }), production_stage: "not_started", completed: false },
+      ],
+    }).order;
+    expect(saved.items.map((entry) => entry.description)).toEqual(["Keep edited", "Added", "Duplicate"]);
+    expect(saved.items[0].id).toBe(order.items[0].id);
+    expect(saved.items[1].id).not.toBe(order.items[0].id);
+    expect(saved.items[2].portable_id).not.toBe(saved.items[1].portable_id);
+    expect(saved.items.some((entry) => entry.id === order.items[1].id)).toBe(false);
+  });
+
+  it("keeps invoiced order financial data locked while allowing production-safe edits", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    service.createOrOpenInvoice(owner, order.id);
+    expect(() => service.updateOrderWorkspace(owner, order.id, {
+      expected_updated_at: service.order(owner, order.id).updated_at,
+      items: [{ ...service.order(owner, order.id).items[0], description: "Changed" }],
+    })).toThrow("invoiced_order_financial_lock");
+    const safe = service.updateOrderWorkspace(owner, order.id, {
+      expected_updated_at: service.order(owner, order.id).updated_at,
+      due_date: "2026-08-30",
+      items: [{ ...service.order(owner, order.id).items[0], production_stage: "waiting", production_required: true, completed: false, internal_note: "safe" }],
+    }).order;
+    expect(safe.due_date).toBe("2026-08-30");
+    expect(safe.items[0].production_stage).toBe("not_started");
+    expect(safe.items[0].internal_note).toBe("safe");
+  });
+
+  it("lists unreleased production-required items but requires Work Orders for operational progress", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, status: "active", items: [item(), item({ description: "No production", production_required: false })] });
+    const workspace = service.orderWorkspace(owner, order.id);
+    let board = service.productionBoard(owner);
+    expect(board.items.map((entry) => entry.description)).toEqual(["Banner"]);
+    expect(board.items[0].production_stage).toBe("not_started");
+    expect(board.items[0].stage_mutable).toBe(false);
+    expect(() => service.setProductionStage(owner, board.items[0].id, "complete")).toThrow("order_item_production_requires_work_order");
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    service.setWorkOrderStage(owner, workOrder.id, "complete");
+    let after = service.order(owner, order.id);
+    expect(after.items[0].completed).toBe(true);
+    expect(after.status).toBe("active");
+    expect(after.production_progress).toEqual({ completed: 1, total: 1, percent: 100 });
+    service.setWorkOrderCompletion(owner, workOrder.id, false);
+    after = service.order(owner, order.id);
+    expect(after.items[0].production_stage).toBe("in_progress");
+    expect(after.items[0].completed).toBe(false);
+    expect(Date.parse(after.updated_at)).toBeGreaterThan(Date.parse(workspace.order.updated_at));
+    expect(() => service.updateOrderWorkspace(owner, order.id, { expected_updated_at: workspace.order.updated_at, internal_notes: "stale after production" })).toThrow("order_conflict");
+    const auditActions = db.prepare("SELECT action FROM audit_events WHERE entity_type = 'work_order' ORDER BY occurred_at").all().map((row) => row.action);
+    expect(auditActions).toEqual(["work_order.stage_move", "work_order.stage_move", "work_order.reopen"]);
+  });
+
+  it("rejects stale workspace saves after status changes", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const workspace = service.orderWorkspace(owner, order.id);
+    const status = service.updateOrderStatus(owner, order.id, "on_hold");
+    expect(status.status).toBe("on_hold");
+    expect(Date.parse(status.updated_at)).toBeGreaterThan(Date.parse(workspace.order.updated_at));
+    expect(() => service.updateOrderWorkspace(owner, order.id, { expected_updated_at: workspace.order.updated_at, internal_notes: "stale after status" })).toThrow("order_conflict");
+  });
+
+  it("rolls back Work Order mutations when audit insertion fails and validates direct item completion booleans", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    expect(() => service.setItemCompletion(owner, order.items[0].id, "yes")).toThrow("invalid_completion");
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    const originalAudit = service.audit;
+    service.audit = (...args) => {
+      if (args[1] === "work_order.stage_move") throw new Error("forced_audit_failure");
+      return originalAudit.call(service, ...args);
+    };
+    expect(() => service.setWorkOrderStage(owner, workOrder.id, "complete")).toThrow("forced_audit_failure");
+    service.audit = originalAudit;
+    const after = service.order(owner, order.id);
+    expect(after.items[0].production_stage).toBe("not_started");
+    expect(after.items[0].completed).toBe(false);
+  });
+
+  it("ignores Workspace item stage payloads as operational production authority", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const saved = service.updateOrderWorkspace(owner, order.id, {
+      expected_updated_at: order.updated_at,
+      items: [{ ...order.items[0], production_stage: "complete", completed: true }],
+    }).order;
+    expect(saved.items[0].production_stage).toBe("not_started");
+    expect(saved.items[0].completed).toBe(false);
+    const auditActions = db.prepare("SELECT action FROM audit_events WHERE entity_type = 'order_item' ORDER BY occurred_at").all().map((row) => row.action);
+    expect(auditActions).toEqual([]);
+  });
+
+  it("uses effective due dates and filters Unassigned under assigned users", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, due_date: "2020-01-01", items: [item({ due_date: null, assigned_user_id: null }), item({ description: "Assigned", assigned_user_id: owner.id })] });
+    const board = service.productionBoard(owner);
+    expect(board.items.find((entry) => entry.id === order.items[0].id).due_date).toBe("2020-01-01");
+    expect(service.productionBoard(owner, { due_state: "late" }).items.length).toBe(2);
+    expect(service.productionBoard(owner, { assigned_user_id: "unassigned" }).items.map((entry) => entry.description)).toEqual(["Banner"]);
+  });
+});
+
+describe("Hardening Group C production source of truth", () => {
+  it("derives pre-release and released Order Item state from the shared production rule", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Source Truth", customer_id: c.id, items: [item({ title: "Face" }), item({ title: "Permit", production_required: false })] });
+    expect(order.production_progress).toEqual({ completed: 0, total: 1, percent: 0 });
+    expect(order.items[0]).toMatchObject({ production_stage: "not_started", completed: false, production_state_source: "pre_release" });
+    expect(order.items[1]).toMatchObject({ production_stage: "not_started", completed: false, production_state_source: "not_required" });
+
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    for (const stage of ["ready", "in_progress", "waiting", "complete"]) {
+      service.setWorkOrderStage(owner, workOrder.id, stage);
+      const updated = service.order(owner, order.id);
+      expect(updated.items[0]).toMatchObject({
+        production_stage: stage,
+        completed: stage === "complete",
+        production_state_source: "work_order",
+        current_work_order_id: workOrder.id,
+      });
+    }
+  });
+
+  it("prevents stale Order Item snapshots and Work Order stage/completed mismatches", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Protected Truth", customer_id: c.id, items: [item({ title: "Panel" })] });
+    expect(() => db.prepare("UPDATE order_items SET production_stage = 'waiting' WHERE id = ?").run(order.items[0].id)).toThrow(/order_item_production_snapshot_invalid/);
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    service.setWorkOrderStage(owner, workOrder.id, "in_progress");
+    expect(() => db.prepare("UPDATE order_items SET production_stage = 'complete', completed = 1 WHERE id = ?").run(order.items[0].id)).toThrow(/order_item_production_snapshot_invalid/);
+    expect(() => db.prepare("UPDATE work_orders SET completed = 1 WHERE id = ?").run(workOrder.id)).toThrow(/work_order_stage_completed_conflict/);
+    expect(() => service.setProductionStage(owner, order.items[0].id, "waiting")).toThrow("work_order_item_stage_managed_by_work_order");
+  });
+
+  it("keeps one active Work Order assignment per item and ignores cancelled history", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Regroup Truth", customer_id: c.id, items: [item({ title: "A" }), item({ title: "B" })] });
+    const first = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    expect(() => db.prepare("INSERT INTO work_order_items (id, tenant_id, work_order_id, order_item_id, position, active, created_at) VALUES ('duplicate-active', ?, ?, ?, 0, 1, ?)").run(owner.tenant_id, first.id, order.items[0].id, new Date().toISOString())).toThrow(/UNIQUE/);
+    service.setWorkOrderStage(owner, first.id, "in_progress");
+    const regrouped = service.regroupOrderProduction(owner, order.id, { mode: "individual_items", reason: "Separate current production work", calendar_resolution: "return_to_order" });
+    expect(regrouped.work_orders).toHaveLength(2);
+    const cancelled = db.prepare("SELECT status FROM work_orders WHERE id = ?").get(first.id);
+    expect(cancelled.status).toBe("cancelled");
+    expect(service.order(owner, order.id).items.map((entry) => entry.production_stage)).toEqual(["not_started", "not_started"]);
+    expect(service.productionBoard(owner).items.some((entry) => entry.id === first.id)).toBe(false);
+  });
+
+  it("requires completed current Work Orders to be reopened before partial-production regrouping", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Partial Regroup", customer_id: c.id, items: [item({ title: "A" }), item({ title: "B" })] });
+    const workOrders = service.sendOrderToProduction(owner, order.id, { mode: "individual_items" }).work_orders;
+    service.setWorkOrderCompletion(owner, workOrders[0].id, true);
+    service.setWorkOrderStage(owner, workOrders[1].id, "in_progress");
+    expect(service.order(owner, order.id).production_progress).toEqual({ completed: 1, total: 2, percent: 50 });
+    expect(() => service.regroupOrderProduction(owner, order.id, { mode: "whole_order", reason: "Combine after partial production", calendar_resolution: "return_to_order" })).toThrow("completed_work_order_reopen_required");
+
+    service.setWorkOrderCompletion(owner, workOrders[0].id, false);
+    const regrouped = service.regroupOrderProduction(owner, order.id, { mode: "whole_order", reason: "Combine after partial production", calendar_resolution: "return_to_order" });
+    expect(regrouped.work_orders).toHaveLength(1);
+    expect(service.order(owner, order.id).items.map((entry) => entry.production_stage)).toEqual(["not_started", "not_started"]);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ? AND order_id = ? AND status = 'active'").get(owner.tenant_id, order.id).count).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ? AND order_id = ? AND status = 'cancelled'").get(owner.tenant_id, order.id).count).toBe(2);
+  });
+
+  it("keeps Calendar completion independent from production and preserves staff financial redaction", async () => {
+    const staff = await service.addUser(owner, { display_name: "Production Privacy", email: "production-privacy@example.com", password: "password123", role: "staff" });
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Privacy Order", customer_id: c.id, items: [item({ title: "Expensive Panel", unit_price_cents: 99999, assigned_user_id: staff.id })] });
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    const event = service.createCalendarEvent(owner, { title: "Production block", order_id: order.id, work_order_id: workOrder.id, start_at: "2026-08-22T09:00", end_at: "2026-08-22T10:00", assigned_user_id: staff.id });
+    service.setCalendarStatus(owner, event.id, "complete");
+    expect(service.order(owner, order.id).items[0].completed).toBe(false);
+    service.setWorkOrderCompletion(owner, workOrder.id, true);
+    expect(service.calendarEvent(owner, event.id).status).toBe("complete");
+    expect(JSON.stringify(service.productionBoard(staff))).not.toMatch(/unit_price_cents|line_total_cents|subtotal_cents|total_cents|payment|pricing|cost|margin/i);
+  });
+});
+
+describe("Version 1 Part 3 attachments", () => {
+  it("stores attachment metadata with checksum and no exposed filesystem path", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const buffer = Buffer.from("%PDF-1.4");
+    const attachment = service.uploadOrderAttachment(owner, order.id, { filename: "../proof.pdf", mime_type: "application/pdf", buffer });
+    expect(attachment.original_filename).toBe("proof.pdf");
+    expect(attachment.sha256).toBe(createHash("sha256").update(buffer).digest("hex"));
+    expect(attachment).not.toHaveProperty("storage_key");
+    expect(attachment.portable_id).toMatch(/^sgp_v1_order_attachment_/);
+  });
+
+  it("blocks active content, path traversal names, and oversized uploads", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "x.svg", mime_type: "image/svg+xml", buffer: Buffer.from("<svg />") })).toThrow("attachment_type_not_allowed");
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "../run.js", mime_type: "text/plain", buffer: Buffer.from("alert(1)") })).toThrow("attachment_type_not_allowed");
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "fake.pdf", mime_type: "application/pdf", buffer: Buffer.from("not a pdf") })).toThrow("attachment_type_not_allowed");
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "fake.txt", mime_type: "text/plain", buffer: Buffer.from("<svg><script /></svg>") })).toThrow("attachment_type_not_allowed");
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "data.json", mime_type: "application/json", buffer: Buffer.from("{bad") })).toThrow("attachment_type_not_allowed");
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "wrong.csv", mime_type: "application/json", buffer: Buffer.from("{}") })).toThrow("attachment_type_not_allowed");
+    process.env.SIGNGUY_SLIM_UPLOAD_LIMIT_BYTES = "2";
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "big.txt", mime_type: "text/plain", buffer: Buffer.from("123") })).toThrow("attachment_too_large");
+  });
+
+  it("enforces tenant authorization, safe headers, integrity checks, soft deletion, and missing-file handling", async () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const attachment = service.uploadOrderAttachment(owner, order.id, { filename: "proof.txt", mime_type: "text/plain", buffer: Buffer.from("proof") });
+    const other = await bootstrap("shop-b");
+    expect(() => service.attachmentDownload(other.user, order.id, attachment.id)).toThrow("order_not_found");
+    const download = service.attachmentDownload(owner, order.id, attachment.id);
+    expect(download.headers["Content-Disposition"]).toContain('filename="proof.txt"');
+    expect(download.headers["X-Content-Type-Options"]).toBe("nosniff");
+    await new Promise((resolve) => download.stream.on("end", resolve).on("error", resolve).resume());
+    const row = db.prepare("SELECT storage_key FROM order_attachments WHERE id = ?").get(attachment.id);
+    db.prepare("UPDATE order_attachments SET byte_size = ? WHERE id = ?").run(999, attachment.id);
+    expect(() => service.attachmentDownload(owner, order.id, attachment.id)).toThrow("attachment_integrity_mismatch");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'attachment.download'").get().count).toBe(1);
+    db.prepare("UPDATE order_attachments SET byte_size = ? WHERE id = ?").run(5, attachment.id);
+    writeFileSync(service.attachmentPath(row.storage_key), "tampered");
+    expect(() => service.attachmentDownload(owner, order.id, attachment.id, { preview: true })).toThrow("attachment_integrity_mismatch");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'attachment.preview'").get().count).toBe(0);
+    writeFileSync(service.attachmentPath(row.storage_key), "proof");
+    unlinkSync(service.attachmentPath(row.storage_key));
+    expect(() => service.attachmentDownload(owner, order.id, attachment.id)).toThrow("attachment_file_missing");
+    const second = service.uploadOrderAttachment(owner, order.id, { filename: "delete.txt", mime_type: "text/plain", buffer: Buffer.from("delete") });
+    service.deleteOrderAttachment(owner, order.id, second.id);
+    expect(service.listOrderAttachments(owner, order.id).some((entry) => entry.id === second.id)).toBe(false);
+    expect(db.prepare("SELECT deleted_at FROM order_attachments WHERE id = ?").get(second.id).deleted_at).toBeTruthy();
+  });
+
+  it("rolls back upload metadata when audit fails and removes orphan files", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const originalAudit = service.audit;
+    service.audit = (...args) => {
+      if (args[1] === "attachment.upload") throw new Error("forced_audit_failure");
+      return originalAudit.call(service, ...args);
+    };
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "proof.txt", mime_type: "text/plain", buffer: Buffer.from("proof") })).toThrow("forced_audit_failure");
+    service.audit = originalAudit;
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_attachments").get().count).toBe(0);
+    expect(countFiles(attachmentRoot)).toBe(0);
+  });
+
+  it("cleans streamed temp files on metadata mismatch failures", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const tempDir = mkdtempSync(join(attachmentRoot, "incoming-"));
+    const tempPath = join(tempDir, "upload.tmp");
+    writeFileSync(tempPath, "proof");
+    expect(() => service.uploadOrderAttachment(owner, order.id, {
+      filename: "proof.txt",
+      mime_type: "text/plain",
+      temp_path: tempPath,
+      byte_size: 999,
+      sha256: createHash("sha256").update("proof").digest("hex"),
+      cleanup_dir: tempDir,
+    })).toThrow("attachment_integrity_mismatch");
+    expect(existsSync(tempDir)).toBe(false);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_attachments").get().count).toBe(0);
+  });
+
+  it("rejects attachment storage through symlink ancestors when supported", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const attachment = service.uploadOrderAttachment(owner, order.id, { filename: "proof.txt", mime_type: "text/plain", buffer: Buffer.from("proof") });
+    const escapeDir = mkdtempSync(join(attachmentRoot, "escape-target-"));
+    const linkPath = join(attachmentRoot, "link");
+    try {
+      symlinkSync(escapeDir, linkPath, "junction");
+    } catch {
+      return;
+    }
+    db.prepare("UPDATE order_attachments SET storage_key = ? WHERE id = ?").run("link/proof.txt", attachment.id);
+    expect(() => service.attachmentDownload(owner, order.id, attachment.id)).toThrow("attachment_path_invalid");
+  });
+
+  it("does not chmod existing attachment parents reached through symlink ancestors", () => {
+    if (process.platform === "win32") return;
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const attachment = service.uploadOrderAttachment(owner, order.id, { filename: "proof.txt", mime_type: "text/plain", buffer: Buffer.from("proof") });
+    const externalRoot = mkdtempSync(join(tmpdir(), "signguy-external-attachments-"));
+    const externalOrder = join(externalRoot, "order");
+    mkdirSync(externalOrder, { recursive: true, mode: 0o755 });
+    chmodSync(externalOrder, 0o755);
+    const linkPath = join(attachmentRoot, "link");
+    try {
+      symlinkSync(externalRoot, linkPath, "dir");
+    } catch {
+      rmSync(externalRoot, { recursive: true, force: true });
+      return;
+    }
+    db.prepare("UPDATE order_attachments SET storage_key = ? WHERE id = ?").run("link/order/proof.txt", attachment.id);
+
+    try {
+      expect(() => service.attachmentDownload(owner, order.id, attachment.id)).toThrow("attachment_path_invalid");
+      expect(statSync(externalOrder).mode & 0o777).toBe(0o755);
+    } finally {
+      rmSync(externalRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlinked attachment root before buffer fallback writes through it when supported", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const target = mkdtempSync(join(attachmentRoot, "root-target-"));
+    const linkPath = join(attachmentRoot, "root-link");
+    try {
+      symlinkSync(target, linkPath, "junction");
+    } catch {
+      return;
+    }
+    process.env.SIGNGUY_SLIM_ATTACHMENT_ROOT = linkPath;
+
+    expect(() => service.uploadOrderAttachment(owner, order.id, { filename: "proof.txt", mime_type: "text/plain", buffer: Buffer.from("proof") })).toThrow("attachment_path_invalid");
+    expect(countFiles(target)).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_attachments").get().count).toBe(0);
+  });
+});
+
+describe("Version 1 Part 4 calendar and dashboard", () => {
+  function calendarPayload(overrides = {}) {
+    return {
+      title: "Install appointment",
+      start_at: "2026-08-21T09:00",
+      end_at: "2026-08-21T10:00",
+      all_day: false,
+      ...overrides,
+    };
+  }
+
+  it("creates, lists, edits, reschedules, completes, reopens, and cancels calendar events without changing Orders or production", () => {
+    service.updateSettings(owner, { shop_timezone: "America/New_York" });
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, status: "active", items: [item({ due_date: "2026-08-21" })] });
+    const event = service.createCalendarEvent(owner, calendarPayload({ order_id: order.id, order_item_id: order.items[0].id, assigned_user_id: owner.id }));
+    expect(event.portable_id).toMatch(/^sgp_v1_calendar_event_/);
+    expect(event.entry_type).toBe("event");
+    expect(event.order_number).toBe(order.order_number);
+    expect(event.local_start_date).toBe("2026-08-21");
+    const orderItemEntries = service.listCalendarEvents(owner, { start_at: "2026-08-21", end_at: "2026-08-22", linked_record_type: "order_item" }).items;
+    expect(orderItemEntries.filter((entry) => !entry.derived)).toHaveLength(1);
+    expect(orderItemEntries.some((entry) => entry.derived && entry.source_type === "production")).toBe(true);
+    const rescheduled = service.updateCalendarEvent(owner, event.id, calendarPayload({ title: "Rescheduled install", order_id: order.id, order_item_id: order.items[0].id, start_at: "2026-08-22T11:00", end_at: "2026-08-22T12:00" }));
+    expect(rescheduled.title).toBe("Rescheduled install");
+    expect(rescheduled.local_start_date).toBe("2026-08-22");
+    const completed = service.setCalendarStatus(owner, event.id, "complete");
+    expect(completed.status).toBe("complete");
+    expect(service.order(owner, order.id).status).toBe("active");
+    expect(service.order(owner, order.id).items[0].completed).toBe(false);
+    expect(service.setCalendarStatus(owner, event.id, "scheduled").status).toBe("scheduled");
+    expect(service.setCalendarStatus(owner, event.id, "cancelled").status).toBe("cancelled");
+    const auditActions = db.prepare("SELECT action FROM audit_events WHERE entity_type = 'calendar_event' ORDER BY occurred_at").all().map((row) => row.action);
+    expect(auditActions).toEqual(["calendar.create", "calendar.reschedule", "calendar.complete", "calendar.reopen", "calendar.cancel"]);
+  });
+
+  it("validates calendar ranges, statuses, same-tenant links, active users, and all-day dates", async () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item()] });
+    const other = await bootstrap("shop-b");
+    const otherCustomer = customer(other.user);
+    const otherOrder = service.createOrder(other.user, { title: "Test Order", customer_id: otherCustomer.id, items: [item()] });
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ end_at: "2026-08-21T09:00" }))).toThrow("invalid_calendar_range");
+    expect(() => service.setCalendarStatus(owner, "missing", "moved")).toThrow("invalid_calendar_status");
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ order_id: otherOrder.id }))).toThrow("calendar_link_not_found");
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ assigned_user_id: other.user.id }))).toThrow("calendar_assigned_user_not_found");
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ order_id: order.id, order_item_id: otherOrder.items[0].id }))).toThrow("calendar_link_not_found");
+    const allDay = service.createCalendarEvent(owner, calendarPayload({ title: "All day", all_day: true, start_at: "2026-08-23", end_at: "2026-08-24" }));
+    expect(allDay.start_at).toBe("2026-08-23");
+    expect(allDay.local_start_date).toBe("2026-08-23");
+    const task = service.createCalendarEvent(owner, calendarPayload({ entry_type: "task", title: "Permit deadline", task_priority: "urgent", all_day: true, start_at: "2026-08-24", end_at: "2026-08-25" }));
+    expect(task.entry_type).toBe("task");
+    expect(task.task_priority).toBe("urgent");
+    const appointment = service.createCalendarEvent(owner, calendarPayload({ entry_type: "appointment", title: "Site survey", appointment_type: "Survey", customer_name: "Jane Co", customer_contact: "jane@example.com", location: "10 Main St" }));
+    expect(appointment.entry_type).toBe("appointment");
+    expect(appointment.customer_contact).toBe("jane@example.com");
+  });
+
+  it("keeps calendar audit writes atomic", () => {
+    const originalAudit = service.audit;
+    service.audit = (...args) => {
+      if (args[1] === "calendar.create") throw new Error("forced_audit_failure");
+      return originalAudit.call(service, ...args);
+    };
+    expect(() => service.createCalendarEvent(owner, calendarPayload())).toThrow("forced_audit_failure");
+    service.audit = originalAudit;
+    expect(db.prepare("SELECT COUNT(*) AS count FROM calendar_events").get().count).toBe(0);
+  });
+
+  it("manages shared views, personal views, departments, memberships, resources, My Schedule, and conflicts without duplicated entries", async () => {
+    const staff = await service.addUser(owner, { display_name: "Installer", email: "installer@example.com", password: "password123", role: "staff" });
+    const departments = service.listDepartments(owner).items;
+    const installDept = departments.find((department) => department.name === "Installation");
+    expect(service.listScheduleViews(owner).items.map((view) => view.name)).toContain("All Shop Schedules");
+    service.updateDepartment(owner, installDept.id, {
+      name: installDept.name,
+      color: installDept.color,
+      active: true,
+      display_order: installDept.display_order,
+      memberships: [{ user_id: staff.id, primary_department: true, active: true }],
+    });
+    const resource = service.createResource(owner, { name: "Bucket Truck", resource_type: "vehicle", capacity: 1, department_id: installDept.id });
+    const installView = service.createScheduleView(owner, {
+      name: "North Installations",
+      visibility: "shared",
+      color: "#336699",
+      filters: { schedule_categories: ["installation"], entry_types: [], department_ids: [installDept.id], employee_ids: [], resource_ids: [], statuses: [], linked: "all" },
+    });
+    const personal = service.createScheduleView(staff, {
+      name: "My installs",
+      visibility: "personal",
+      filters: { schedule_categories: ["installation"], entry_types: [], department_ids: [], employee_ids: [staff.id], resource_ids: [], statuses: [], linked: "all" },
+    });
+    expect(service.listScheduleViews(staff).items.map((view) => view.name)).toContain("My installs");
+    expect(service.listScheduleViews(owner).items.map((view) => view.name)).not.toContain("My installs");
+    expect(() => service.scheduleView(owner, personal.id)).toThrow("permission_denied");
+
+    const entry = service.createCalendarEvent(owner, {
+      title: "Install channel letters",
+      entry_type: "appointment",
+      schedule_category: "installation",
+      department_id: installDept.id,
+      start_at: "2026-08-21T09:00",
+      end_at: "2026-08-21T10:00",
+      assigned_user_id: owner.id,
+      assignee_user_ids: [owner.id, staff.id],
+      resource_reservations: [{ resource_id: resource.id, quantity: 1 }],
+    });
+    expect(entry.assignees.map((assignee) => assignee.user_id).sort()).toEqual([owner.id, staff.id].sort());
+    expect(entry.assigned_user_id).toBe(owner.id);
+    expect(entry.resource_reservations[0].resource_id).toBe(resource.id);
+    expect(service.listCalendarEvents(owner, { start_at: "2026-08-21", end_at: "2026-08-22", view_id: installView.id }).items.filter((item) => item.id === entry.id)).toHaveLength(1);
+    expect(service.listCalendarEvents(staff, { start_at: "2026-08-21", end_at: "2026-08-22", my_schedule: true }).items.map((item) => item.id)).toContain(entry.id);
+
+    expect(() => service.createCalendarEvent(owner, {
+      title: "Overlapping truck",
+      schedule_category: "installation",
+      start_at: "2026-08-21T09:30",
+      end_at: "2026-08-21T10:30",
+      assignee_user_ids: [staff.id],
+      resource_reservations: [{ resource_id: resource.id, quantity: 1 }],
+    })).toThrow("schedule_conflict");
+    expect(() => service.createCalendarEvent(staff, {
+      title: "Staff override",
+      schedule_category: "installation",
+      start_at: "2026-08-21T09:30",
+      end_at: "2026-08-21T10:30",
+      assignee_user_ids: [staff.id],
+      conflict_override: true,
+      conflict_override_reason: "Needs same slot",
+    })).toThrow("permission_denied");
+    const override = service.createCalendarEvent(owner, {
+      title: "Manager override",
+      schedule_category: "installation",
+      start_at: "2026-08-21T09:30",
+      end_at: "2026-08-21T10:30",
+      assignee_user_ids: [staff.id],
+      conflict_override: true,
+      conflict_override_reason: "Owner approved double coverage",
+    });
+    expect(override.conflict_override_reason).toBe("Owner approved double coverage");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'calendar.create' AND diff_json LIKE '%Owner approved double coverage%'").get().count).toBe(1);
+    const defaultViews = service.listScheduleViews(owner).items;
+    expect(defaultViews.find((view) => view.system_key === "all_shop").color).toBe("#75638F");
+    expect(defaultViews.find((view) => view.system_key === "production").color).toBe("#7B3DA6");
+    expect(defaultViews.find((view) => view.system_key === "installation").color).toBe("#3F7FC4");
+    expect(defaultViews.find((view) => view.system_key === "sales").color).toBe("#E06F00");
+    expect(defaultViews.find((view) => view.system_key === "customer_appointments").color).toBe("#E06F00");
+    const defaultDepartments = service.listDepartments(owner).items;
+    expect(defaultDepartments.find((department) => department.name === "Production").color).toBe("#7B3DA6");
+    expect(defaultDepartments.find((department) => department.name === "Installation").color).toBe("#3F7FC4");
+    expect(defaultDepartments.find((department) => department.name === "Sales").color).toBe("#E06F00");
+    expect(() => service.updateScheduleView(owner, defaultViews.find((view) => view.system_key === "all_shop").id, { active: false })).toThrow("system_view_protected");
+  });
+
+  it("rejects cross-tenant Stage 2 relationship IDs and unauthorized staff management directly", async () => {
+    const staff = await service.addUser(owner, { display_name: "Staff", email: "calendar-staff@example.com", password: "password123", role: "staff" });
+    const other = await bootstrap("foreign-shop");
+    const foreignDept = service.listDepartments(other.user).items.find((department) => department.name === "Installation");
+    const foreignResource = service.createResource(other.user, { name: "Foreign Truck", resource_type: "vehicle", capacity: 1, department_id: foreignDept.id });
+    const foreignUser = await service.addUser(other.user, { display_name: "Foreign Staff", email: "foreign-staff@example.com", password: "password123", role: "staff" });
+    const foreignCustomer = customer(other.user);
+    const foreignOrder = service.createOrder(other.user, { title: "Test Order", customer_id: foreignCustomer.id, items: [item()] });
+
+    expect(() => service.createDepartment(staff, { name: "Nope", color: "#111111" })).toThrow("permission_denied");
+    expect(() => service.createResource(staff, { name: "Nope", resource_type: "equipment", capacity: 1 })).toThrow("permission_denied");
+    expect(() => service.createScheduleView(staff, { name: "Shared Nope", visibility: "shared", filters: { schedule_categories: [], entry_types: [], department_ids: [], employee_ids: [], resource_ids: [], statuses: [], linked: "all" } })).toThrow("permission_denied");
+    const systemView = service.listScheduleViews(owner).items.find((view) => view.system_key === "production");
+    expect(() => service.updateScheduleView(owner, systemView.id, { name: "Renamed Production" })).toThrow("system_view_protected");
+
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ department_id: foreignDept.id }))).toThrow("department_not_found");
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ assignee_user_ids: [foreignUser.id] }))).toThrow("calendar_assigned_user_not_found");
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ resource_reservations: [{ resource_id: foreignResource.id, quantity: 1 }] }))).toThrow("resource_not_found");
+    expect(() => service.listCalendarEvents(owner, { start_at: "2026-08-21", end_at: "2026-08-22", department_ids: [foreignDept.id] })).toThrow("department_not_found");
+    expect(() => service.listCalendarEvents(owner, { start_at: "2026-08-21", end_at: "2026-08-22", employee_ids: [foreignUser.id] })).toThrow("user_not_found");
+    expect(() => service.listCalendarEvents(owner, { start_at: "2026-08-21", end_at: "2026-08-22", resource_ids: [foreignResource.id] })).toThrow("resource_not_found");
+    expect(() => service.listCalendarEvents(owner, { start_at: "2026-08-21", end_at: "2026-08-22", order_id: foreignOrder.id })).toThrow("calendar_link_not_found");
+    expect(() => service.listCalendarEvents(staff, { start_at: "2026-08-21", end_at: "2026-08-22", employee_ids: [owner.id] })).toThrow("permission_denied");
+    expect(() => service.createScheduleView(owner, { name: "Foreign Filter", visibility: "shared", filters: { schedule_categories: [], entry_types: [], department_ids: [foreignDept.id], employee_ids: [], resource_ids: [], statuses: [], linked: "all" } })).toThrow("department_not_found");
+    expect(() => service.createScheduleView(owner, { name: "Bad Filter", visibility: "personal", filters: { schedule_categories: [], entry_types: [], department_ids: [], employee_ids: [], resource_ids: [], statuses: [], linked: "all", sql: "DROP TABLE calendar_events" } })).toThrow();
+  });
+
+  it("synchronizes primary and additional assignees without drift and preserves rollback state", async () => {
+    const staff = await service.addUser(owner, { display_name: "Installer Two", email: "installer-two@example.com", password: "password123", role: "staff" });
+    const entry = service.createCalendarEvent(owner, calendarPayload({ assigned_user_id: owner.id }));
+    expect(entry.assigned_user_id).toBe(owner.id);
+    expect(entry.assignees).toMatchObject([{ user_id: owner.id, primary_assignee: true }]);
+
+    const reassigned = service.updateCalendarEvent(owner, entry.id, calendarPayload({
+      title: "Reassigned install",
+      primary_assignee_user_id: staff.id,
+      assignee_user_ids: [owner.id, staff.id, staff.id],
+    }));
+    expect(reassigned.assigned_user_id).toBe(staff.id);
+    expect(reassigned.assignees.map((assignee) => assignee.user_id).sort()).toEqual([owner.id, staff.id].sort());
+    expect(reassigned.assignees.filter((assignee) => assignee.primary_assignee)).toHaveLength(1);
+
+    const originalWrite = service.writeCalendarResources;
+    service.writeCalendarResources = () => {
+      throw new Error("forced_resource_write_failure");
+    };
+    expect(() => service.updateCalendarEvent(owner, entry.id, calendarPayload({ title: "Failed write", primary_assignee_user_id: owner.id, assignee_user_ids: [owner.id] }))).toThrow("forced_resource_write_failure");
+    service.writeCalendarResources = originalWrite;
+    expect(service.calendarEvent(owner, entry.id).assigned_user_id).toBe(staff.id);
+
+    const unassigned = service.updateCalendarEvent(owner, entry.id, calendarPayload({ title: "Unassigned", assigned_user_id: null, primary_assignee_user_id: null, assignee_user_ids: [] }));
+    expect(unassigned.assigned_user_id).toBe(null);
+    expect(unassigned.assignees).toEqual([]);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM calendar_event_assignees WHERE calendar_event_id = ?").get(entry.id).count).toBe(0);
+  });
+
+  it("deduplicates My Schedule responsibility and excludes inactive department memberships", async () => {
+    const staff = await service.addUser(owner, { display_name: "Department Staff", email: "department-staff@example.com", password: "password123", role: "staff" });
+    const installDept = service.listDepartments(owner).items.find((department) => department.name === "Installation");
+    service.updateDepartment(owner, installDept.id, { memberships: [{ user_id: staff.id, primary_department: true, active: true }] });
+    const entry = service.createCalendarEvent(owner, {
+      ...calendarPayload({ title: "Many matching relationships", assigned_user_id: staff.id, department_id: installDept.id }),
+      assignee_user_ids: [staff.id],
+    });
+    expect(service.listCalendarEvents(staff, { start_at: "2026-08-21", end_at: "2026-08-22", my_schedule: true }).items.filter((item) => item.id === entry.id)).toHaveLength(1);
+    service.updateDepartment(owner, installDept.id, { memberships: [{ user_id: staff.id, primary_department: false, active: false }] });
+    service.updateCalendarEvent(owner, entry.id, { assigned_user_id: null, primary_assignee_user_id: null, assignee_user_ids: [] });
+    expect(service.listCalendarEvents(staff, { start_at: "2026-08-21", end_at: "2026-08-22", my_schedule: true }).items.filter((item) => item.id === entry.id)).toHaveLength(0);
+  });
+
+  it("enforces resource capacity, unavailable periods, adjacent intervals, and audited overrides", async () => {
+    const resource = service.createResource(owner, {
+      name: "Wrap Bay",
+      resource_type: "production_area",
+      capacity: 2,
+      unavailable: [{ start_at: "2026-08-22T09:00", end_at: "2026-08-22T10:00", reason: "Maintenance", hard_block: true }],
+    });
+    service.createCalendarEvent(owner, calendarPayload({ title: "First bay slot", resource_reservations: [{ resource_id: resource.id, quantity: 1 }] }));
+    service.createCalendarEvent(owner, calendarPayload({ title: "Second bay slot", resource_reservations: [{ resource_id: resource.id, quantity: 1 }] }));
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ title: "Over capacity", resource_reservations: [{ resource_id: resource.id, quantity: 1 }] }))).toThrow("schedule_conflict");
+    expect(service.createCalendarEvent(owner, calendarPayload({ title: "Adjacent bay slot", start_at: "2026-08-21T10:00", end_at: "2026-08-21T11:00", resource_reservations: [{ resource_id: resource.id, quantity: 2 }] }))).toBeTruthy();
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ title: "Maintenance overlap", start_at: "2026-08-22T09:30", end_at: "2026-08-22T09:45", resource_reservations: [{ resource_id: resource.id, quantity: 1 }] }))).toThrow("schedule_conflict");
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ title: "Weak reason", resource_reservations: [{ resource_id: resource.id, quantity: 1 }], conflict_override: true, conflict_override_reason: "   " }))).toThrow("conflict_override_reason_required");
+    const override = service.createCalendarEvent(owner, calendarPayload({ title: "Override capacity", resource_reservations: [{ resource_id: resource.id, quantity: 1 }], conflict_override: true, conflict_override_reason: "Manager approved short overlap" }));
+    expect(override.conflict_override_reason).toBe("Manager approved short overlap");
+    const audit = db.prepare("SELECT actor_user_id, diff_json, occurred_at FROM audit_events WHERE action = 'calendar.create' AND entity_id = ?").get(override.id);
+    expect(audit.actor_user_id).toBe(owner.id);
+    expect(audit.occurred_at).toBeTruthy();
+    expect(JSON.parse(audit.diff_json).conflicts[0].resource_id).toBe(resource.id);
+  });
+
+  it("keeps calendar responses free of restricted financial fields for staff", async () => {
+    const staff = await service.addUser(owner, { display_name: "Calendar Staff", email: "calendar-redaction@example.com", password: "password123", role: "staff" });
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, items: [item({ unit_price_cents: 9999 })] });
+    service.createOrOpenInvoice(owner, order.id);
+    service.createCalendarEvent(owner, calendarPayload({ title: "Linked but redacted", order_id: order.id, order_item_id: order.items[0].id, assigned_user_id: staff.id }));
+    const event = service.listCalendarEvents(staff, { start_at: "2026-08-21", end_at: "2026-08-22", my_schedule: true }).items[0];
+    expect(event.order_number).toBe(order.order_number);
+    expect(JSON.stringify(event)).not.toMatch(/unit_price_cents|line_total_cents|subtotal_cents|total_cents|invoice|payment|cost|margin|pricing/i);
+  });
+
+  it("derives dashboard production, workweek calendar, attention distinctions, duplicate prevention, and payment wording", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Test Order", customer_id: c.id, due_date: "2020-01-01", status: "active", items: [item({ due_date: "2020-01-01" })] });
+    service.createCalendarEvent(owner, { title: "Missed install", all_day: true, start_at: "2020-01-01", end_at: "2020-01-02", order_id: order.id });
+    const invoice = service.createOrOpenInvoice(owner, order.id).invoice;
+    service.setInvoiceDocumentStatus(owner, invoice.id, "issued");
+    const attention = service.attentionItems(owner, "2020-01-02");
+    expect(attention.map((entry) => `${entry.reason}:${entry.severity}`)).toEqual(expect.arrayContaining([
+      "order_due:overdue",
+      "production_due:overdue",
+      "calendar_due:overdue",
+      "payment_attention:overdue",
+    ]));
+    expect(attention.filter((entry) => entry.reason === "order_due" && entry.source_id === order.id)).toHaveLength(1);
+    db.prepare("UPDATE invoices SET due_date = NULL WHERE id = ?").run(invoice.id);
+    const payment = service.attentionItems(owner, "2020-01-02").find((entry) => entry.reason === "payment_attention");
+    expect(payment.severity).toBe("payment attention");
+    const firstDashboard = service.dashboard(owner);
+    const monday = firstDashboard.calendar.start_date;
+    service.createCalendarEvent(owner, { title: "Low priority shop note", entry_type: "task", task_priority: "low", all_day: true, start_at: monday, end_at: addDays(monday, 1) });
+    service.createCalendarEvent(owner, { title: "High priority permit call", entry_type: "task", task_priority: "high", all_day: true, start_at: monday, end_at: addDays(monday, 1) });
+    const dashboard = service.dashboard(owner);
+    expect(dashboard.production.stages.map((stage) => stage.stage)).toEqual(["not_started", "ready", "in_progress", "waiting", "complete"]);
+    expect(dashboard.calendar.days).toHaveLength(5);
+    expect(dashboard.calendar.days.map((day) => new Date(`${day.date}T00:00:00.000Z`).getUTCDay())).toEqual([1, 2, 3, 4, 5]);
+    expect(dashboard.calendar.days.flatMap((day) => day.entries.map((entry) => entry.title))).toContain("High priority permit call");
+    expect(dashboard.calendar.days.flatMap((day) => day.entries.map((entry) => entry.title))).not.toContain("Low priority shop note");
+    expect(dashboard.summary.cards.map((card) => card.key)).toEqual(["active_orders", "production", "open_quotes", "today_schedule", "invoice_balance", "month_expenses", "incoming", "attention"]);
+    const invoiceBalanceCard = dashboard.summary.cards.find((card) => card.key === "invoice_balance");
+    expect(dashboard.summary.recent_orders[0]).toMatchObject({ order_number: order.order_number, customer: "Jane Co" });
+    expect(dashboard.summary.payments).toMatchObject({ balance_due_cents: invoiceBalanceCard.value_cents, open_invoice_count: 1, href: "#/payments" });
+    expect(dashboard.sample_data.available).toBe(true);
+    expect(dashboard.widgets.important_week).toBe(true);
+    expect(dashboard.clock.label).toBe("Clocked In");
+    expect(dashboard.messages.customer.label).toBe("Customer Messages");
+  });
+
+  it("adds tenant-scoped removable Home demo data once and refreshes dashboard summaries", async () => {
+    const staff = await service.addUser(owner, { display_name: "Sample Staff", email: "sample-staff@example.com", password: "password123", role: "staff" });
+    expect(() => service.seedDashboardSampleData(staff)).toThrow("permission_denied");
+
+    const seeded = service.seedDashboardSampleData(owner);
+    expect(seeded.seeded).toBe(true);
+    expect(seeded.dashboard.sample_data.seeded).toBe(true);
+    expect(seeded.dashboard.summary.cards.find((card) => card.key === "active_orders").value).toBeGreaterThanOrEqual(6);
+    expect(seeded.dashboard.summary.cards.find((card) => card.key === "open_quotes").value).toBeGreaterThanOrEqual(2);
+    expect(seeded.dashboard.summary.cards.find((card) => card.key === "invoice_balance").value_cents).toBeGreaterThan(0);
+    expect(seeded.dashboard.summary.cards.find((card) => card.key === "month_expenses").value_cents).toBeGreaterThan(0);
+    expect(seeded.dashboard.summary.production_focus.map((entry) => entry.stage)).toEqual(expect.arrayContaining(["in_progress", "waiting"]));
+    const upcomingTitles = seeded.dashboard.summary.upcoming_events.map((entry) => entry.title);
+    expect(upcomingTitles.length).toBeGreaterThan(0);
+    const calendarEntries = seeded.dashboard.calendar.days.flatMap((day) => day.entries.map((entry) => entry.title));
+    expect(calendarEntries).toEqual(expect.arrayContaining(["Site survey: Metro Pet Clinic", "Production: Harbor House Realty", "Pickup: BrightPath Preschool", "Client art approval call"]));
+    expect(upcomingTitles.some((title) => ["Site survey: Metro Pet Clinic", "Production: Harbor House Realty", "Pickup: BrightPath Preschool", "Client art approval call"].includes(title) || title.startsWith("Order due:") || title.startsWith("Production due:"))).toBe(true);
+    expect(seeded.dashboard.messages.customer.count).toBeGreaterThan(0);
+
+    const customerCount = db.prepare("SELECT COUNT(*) AS count FROM customers WHERE tenant_id = ? AND email LIKE 'demo+%@signguy.example'").get(owner.tenant_id).count;
+    expect(customerCount).toBe(7);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(owner.tenant_id).count).toBeGreaterThan(20);
+    const again = service.seedDashboardSampleData(owner);
+    expect(again.seeded).toBe(false);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM customers WHERE tenant_id = ? AND email LIKE 'demo+%@signguy.example'").get(owner.tenant_id).count).toBe(customerCount);
+    const removed = service.removeDashboardSampleData(owner);
+    expect(removed.removed).toBe(true);
+    expect(removed.dashboard.sample_data.seeded).toBe(false);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM customers WHERE tenant_id = ? AND email LIKE 'demo+%@signguy.example'").get(owner.tenant_id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_intake_items WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_announcements WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+    expect(service.createCustomer(owner, { contact_name: "Real Customer", billing_address: address }).customer_number).toBe("C-00001");
+    expect(service.removeDashboardSampleData(owner).removed).toBe(false);
+  });
+
+  it("restores demo markers from backup so restored demo data remains removable", async () => {
+    service.seedDashboardSampleData(owner);
+    const passphrase = "long-passphrase-demo";
+    const backup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const payload = decryptBackup(backup.buffer, passphrase);
+    expect(payload.data.demo_data_records).toBeUndefined();
+    expect(payload.manifest.slim_local_demo_data_records.length).toBeGreaterThan(20);
+
+    const targetSession = await bootstrap("target-demo-restore");
+    const targetActor = targetSession.user;
+    const targetName = service.tenant(targetActor.tenant_id).company_name;
+    service.restoreBackup(targetActor, backupFile(backup), {
+      passphrase,
+      confirmation_phrase: targetName,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+
+    expect(service.dashboard(targetActor).sample_data.seeded).toBe(true);
+    const removed = service.removeDashboardSampleData(targetActor);
+    expect(removed.dashboard.sample_data.seeded).toBe(false);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM customers WHERE tenant_id = ? AND email LIKE 'demo+%@signguy.example'").get(targetActor.tenant_id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(0);
+  });
+
+  it("removes demo data without deleting real records that reference demo customers", async () => {
+    service.seedDashboardSampleData(owner);
+    const demoCustomer = db.prepare("SELECT * FROM customers WHERE tenant_id = ? AND email = 'demo+brightpath@signguy.example'").get(owner.tenant_id);
+    const realOrder = service.createOrder(owner, {
+      title: "Real order using demo customer",
+      customer_id: demoCustomer.id,
+      items: [item({ title: "Real banner", description: "Real banner" })],
+    });
+
+    const removed = service.removeDashboardSampleData(owner);
+    expect(removed.removed).toBe(true);
+    expect(service.order(owner, realOrder.id).customer_id).toBe(demoCustomer.id);
+    expect(db.prepare("SELECT id FROM customers WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, demoCustomer.id).id).toBe(demoCustomer.id);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+    expect(service.createOrder(owner, {
+      title: "Next real order",
+      customer_id: demoCustomer.id,
+      items: [item({ title: "Next real banner", description: "Next real banner" })],
+    }).order_number).toBe("O-00009");
+  });
+
+  it("does not delete marked demo parents after real attachments are added", async () => {
+    service.seedDashboardSampleData(owner);
+    const demoOrder = db.prepare("SELECT * FROM orders WHERE tenant_id = ? AND title = 'Perforated window graphics'").get(owner.tenant_id);
+    const demoExpense = db.prepare("SELECT * FROM expenses WHERE tenant_id = ? AND vendor = 'Demo Vinyl Supply'").get(owner.tenant_id);
+    const orderItemCount = db.prepare("SELECT COUNT(*) AS count FROM order_items WHERE tenant_id = ? AND order_id = ?").get(owner.tenant_id, demoOrder.id).count;
+    const workOrderCount = db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ? AND order_id = ?").get(owner.tenant_id, demoOrder.id).count;
+    const orderAttachment = service.uploadOrderAttachment(owner, demoOrder.id, { filename: "real-artwork.txt", mime_type: "text/plain", buffer: Buffer.from("real artwork") });
+    service.uploadExpenseAttachment(owner, demoExpense.id, { filename: "real-receipt.txt", mime_type: "text/plain", buffer: Buffer.from("real receipt") });
+
+    const removed = service.removeDashboardSampleData(owner);
+    expect(removed.removed).toBe(true);
+    expect(db.prepare("SELECT id FROM orders WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, demoOrder.id).id).toBe(demoOrder.id);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_items WHERE tenant_id = ? AND order_id = ?").get(owner.tenant_id, demoOrder.id).count).toBe(orderItemCount);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ? AND order_id = ?").get(owner.tenant_id, demoOrder.id).count).toBe(workOrderCount);
+    expect(db.prepare("SELECT id FROM expenses WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, demoExpense.id).id).toBe(demoExpense.id);
+    expect(db.prepare("SELECT byte_size FROM order_attachments WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL").get(owner.tenant_id, orderAttachment.id).byte_size).toBe(12);
+    expect(db.prepare("SELECT byte_size FROM expense_attachments WHERE tenant_id = ? AND expense_id = ? AND deleted_at IS NULL").get(owner.tenant_id, demoExpense.id).byte_size).toBe(12);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+  });
+
+  it("retains converted demo estimates and items when removing remaining demo data", () => {
+    service.seedDashboardSampleData(owner);
+    const demoEstimate = db
+      .prepare(
+        `SELECT e.*
+         FROM estimates e
+         JOIN demo_data_records d ON d.tenant_id = e.tenant_id AND d.entity_type = 'estimate' AND d.entity_id = e.id
+         WHERE e.tenant_id = ? LIMIT 1`,
+      )
+      .get(owner.tenant_id);
+    const demoItem = db.prepare("SELECT * FROM estimate_items WHERE tenant_id = ? AND estimate_id = ? ORDER BY position LIMIT 1").get(owner.tenant_id, demoEstimate.id);
+    const convertedOrder = service.convertEstimate(owner, demoEstimate.id).order;
+
+    const removed = service.removeDashboardSampleData(owner);
+    expect(removed.removed).toBe(true);
+    expect(db.prepare("SELECT id FROM estimates WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, demoEstimate.id).id).toBe(demoEstimate.id);
+    expect(db.prepare("SELECT id FROM estimate_items WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, demoItem.id).id).toBe(demoItem.id);
+    expect(db.prepare("SELECT source_estimate_id FROM orders WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, convertedOrder.id).source_estimate_id).toBe(demoEstimate.id);
+    expect(db.prepare("SELECT source_estimate_item_id FROM order_items WHERE tenant_id = ? AND order_id = ? LIMIT 1").get(owner.tenant_id, convertedOrder.id).source_estimate_item_id).toBe(demoItem.id);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+  });
+
+  it("recognizes and removes the legacy pre-marker sample data set", async () => {
+    const sampleCustomer = service.createCustomer(owner, {
+      contact_name: "Riley Sample",
+      business_name: "Canyon Coffee Sample",
+      email: "sample-dashboard@signguy.example",
+      billing_address: address,
+    });
+    const sampleOrder = service.createOrder(owner, {
+      title: "Sample Lobby Sign Package",
+      customer_id: sampleCustomer.id,
+      items: [item({ title: "Acrylic lobby sign", description: "Dimensional acrylic wall logo" })],
+    });
+    const sampleWorkOrder = service.sendOrderToProduction(owner, sampleOrder.id, { mode: "whole_order" }).work_orders[0];
+    const sampleInvoice = service.createOrOpenInvoice(owner, sampleOrder.id, {}).invoice;
+    const sampleEstimate = service.createEstimate(owner, {
+      title: "Sample Vehicle Lettering Quote",
+      customer_id: sampleCustomer.id,
+      items: [item({ title: "Truck door lettering", description: "Two-color vinyl lettering set" })],
+    });
+    service.createCalendarEvent(owner, {
+      title: "Sample quote follow-up",
+      entry_type: "task",
+      schedule_category: "sales",
+      task_priority: "high",
+      estimate_id: sampleEstimate.id,
+      start_at: "2026-09-08",
+      end_at: "2026-09-09",
+      all_day: true,
+    });
+    service.createManualCommunication(owner, {
+      customer_id: sampleCustomer.id,
+      direction: "inbound",
+      channel: "email",
+      subject: "Sample customer proof question",
+      body_text: "Can you confirm the acrylic color before production?",
+      related_entity_type: "order",
+      related_entity_id: sampleOrder.id,
+    });
+    service.createExpense(owner, {
+      expense_date: "2026-09-08",
+      vendor: "Sample Vinyl Supply",
+      category: "Materials",
+      description: "Roll stock for sample dashboard jobs",
+      amount_cents: 18675,
+      payment_method: "credit_card",
+    });
+
+    expect(service.dashboard(owner).sample_data.seeded).toBe(true);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+    const removed = service.removeDashboardSampleData(owner);
+    expect(removed.removed).toBe(true);
+    expect(db.prepare("SELECT id FROM customers WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, sampleCustomer.id)).toBeUndefined();
+    expect(db.prepare("SELECT id FROM orders WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, sampleOrder.id)).toBeUndefined();
+    expect(db.prepare("SELECT id FROM work_orders WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, sampleWorkOrder.id)).toBeUndefined();
+    expect(db.prepare("SELECT id FROM invoices WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, sampleInvoice.id)).toBeUndefined();
+    expect(db.prepare("SELECT id FROM estimates WHERE tenant_id = ? AND id = ?").get(owner.tenant_id, sampleEstimate.id)).toBeUndefined();
+    expect(db.prepare("SELECT id FROM expenses WHERE tenant_id = ? AND vendor = 'Sample Vinyl Supply'").get(owner.tenant_id)).toBeUndefined();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM demo_data_records WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(0);
+  });
+});
+
+describe("Stage 3 Work Orders and commercial bundles", () => {
+  function calendarPayload(overrides = {}) {
+    return {
+      title: "Production block",
+      entry_type: "event",
+      schedule_category: "production",
+      start_at: "2026-08-21T09:00",
+      end_at: "2026-08-21T10:00",
+      all_day: false,
+      ...overrides,
+    };
+  }
+
+  it("requires new Order and Order Item titles while preserving fallback display for existing rows", () => {
+    const c = customer(owner);
+    expect(() => service.createOrder(owner, { customer_id: c.id, items: [item()] })).toThrow();
+    expect(() => service.createOrder(owner, { title: "   ", customer_id: c.id, items: [item()] })).toThrow();
+    expect(() => service.createOrder(owner, { title: "Pole Banner Project", customer_id: c.id, items: [item({ title: "   " })] })).toThrow();
+    const order = service.createOrder(owner, { title: "Pole Banner Project", customer_id: c.id, items: [item({ title: "Main Street Banner" })] });
+    db.prepare("UPDATE orders SET title = NULL WHERE id = ?").run(order.id);
+    db.prepare("UPDATE order_items SET title = NULL WHERE id = ?").run(order.items[0].id);
+    const fallback = service.order(owner, order.id);
+    expect(fallback.title).toBe(`Order ${order.order_number}`);
+    expect(fallback.items[0].title).toBe("Banner");
+  });
+
+  it("generates whole, individual, custom, and mixed-independent Work Orders idempotently", () => {
+    const c = customer(owner);
+    const whole = service.createOrder(owner, { title: "Whole Order", customer_id: c.id, items: [item({ title: "Sign" }), item({ title: "Install" }), item({ title: "Permit", production_required: false })] });
+    const sent = service.sendOrderToProduction(owner, whole.id, { mode: "whole_order" });
+    const again = service.sendOrderToProduction(owner, whole.id, { mode: "whole_order" });
+    expect(sent.work_orders).toHaveLength(1);
+    expect(sent.work_orders[0].items.map((entry) => entry.title)).toEqual(["Sign", "Install"]);
+    expect(again.already_sent).toBe(true);
+    expect(again.work_orders[0].id).toBe(sent.work_orders[0].id);
+
+    const individual = service.createOrder(owner, { title: "Individual Order", customer_id: c.id, items: [item({ title: "Door" }), item({ title: "Hood" })] });
+    expect(service.sendOrderToProduction(owner, individual.id, { mode: "individual_items" }).work_orders.map((entry) => entry.title)).toEqual(["Door", "Hood"]);
+
+    const custom = service.createOrder(owner, { title: "Custom Order", customer_id: c.id, items: [item({ title: "Building Signs" }), item({ title: "Door Lettering" }), item({ title: "Installation" })] });
+    const grouped = service.sendOrderToProduction(owner, custom.id, {
+      mode: "custom_groups",
+      groups: [{ title: "Main Building Signs", item_ids: [custom.items[0].id, custom.items[1].id] }],
+      independent_item_ids: [custom.items[2].id],
+    });
+    expect(grouped.work_orders.map((entry) => `${entry.title}:${entry.item_count}`)).toEqual(["Main Building Signs:2", "Installation:1"]);
+    expect(() => service.regroupOrderProduction(owner, custom.id, { mode: "custom_groups", groups: [{ title: "Bad", item_ids: [custom.items[0].id] }], independent_item_ids: [] })).toThrow("production_items_unassigned");
+  });
+
+  it("links calendar entries to Work Orders and keeps completion independent with staff financial redaction", async () => {
+    const staff = await service.addUser(owner, { display_name: "Production Staff", email: "wo-staff@example.com", password: "password123", role: "staff" });
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Truck Lettering", customer_id: c.id, items: [item({ title: "Driver Door", unit_price_cents: 9999, assigned_user_id: staff.id })] });
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    const event = service.createCalendarEvent(owner, calendarPayload({ title: "Design block", order_id: order.id, work_order_id: workOrder.id, assigned_user_id: staff.id }));
+    expect(event.work_order_id).toBe(workOrder.id);
+    service.setCalendarStatus(owner, event.id, "complete");
+    expect(service.workOrderSummary(owner, workOrder.id).completed).toBe(false);
+    service.setWorkOrderCompletion(owner, workOrder.id, true);
+    expect(service.calendarEvent(owner, event.id).status).toBe("complete");
+    const board = service.productionBoard(staff).items.find((entry) => entry.id === workOrder.id);
+    expect(board.title).toBe("Truck Lettering");
+    expect(JSON.stringify(service.workOrderSummary(staff, workOrder.id))).not.toMatch(/unit_price_cents|line_total_cents|subtotal_cents|total_cents|invoice|payment|pricing|margin|cost/i);
+  });
+
+  it("guards regrouping after production begins and handles future calendar links explicitly", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Regroup Order", customer_id: c.id, items: [item({ title: "Panel A" }), item({ title: "Panel B" })] });
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    service.setWorkOrderStage(owner, workOrder.id, "in_progress");
+    service.createCalendarEvent(owner, calendarPayload({ order_id: order.id, work_order_id: workOrder.id, start_at: "2999-01-01T09:00", end_at: "2999-01-01T10:00" }));
+    expect(() => service.regroupOrderProduction(owner, order.id, { mode: "individual_items", reason: "x" })).toThrow("production_regroup_reason_required");
+    expect(() => service.regroupOrderProduction(owner, order.id, { mode: "individual_items", reason: "Separate panels for finishing" })).toThrow("calendar_resolution_required");
+    const regrouped = service.regroupOrderProduction(owner, order.id, { mode: "individual_items", reason: "Separate panels for finishing", calendar_resolution: "return_to_order" });
+    expect(regrouped.work_orders).toHaveLength(2);
+    expect(service.listCalendarEvents(owner, { start_at: "2999-01-01", end_at: "2999-01-02" }).items[0].work_order_id).toBe(null);
+  });
+
+  it("saves commercial bundles, allocates manual totals server-side, propagates estimate bundles, and locks issued invoices", () => {
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, { title: "Ignored", customer_id: c.id, items: [item({ title: "Sign", unit_price_cents: 1000 }), item({ title: "Install", unit_price_cents: 500 })] });
+    const saved = service.saveCommercialBundles(owner, "estimate", estimate.id, {
+      bundles: [{
+        title: "Sign Package",
+        pricing_mode: "bundle_price",
+        manual_total_cents: 3333,
+        override_reason: "Package price approved",
+        show_member_prices: false,
+        item_ids: estimate.items.map((entry) => entry.id),
+      }],
+    }).items[0];
+    expect(saved.total_cents).toBe(3333);
+    expect(saved.items.reduce((sum, entry) => sum + entry.allocated_cents, 0)).toBe(3333);
+    expect(() => service.saveCommercialBundles(owner, "estimate", estimate.id, { bundles: [{ title: "Duplicate", pricing_mode: "itemized_subtotal", item_ids: [estimate.items[0].id, estimate.items[0].id] }] })).toThrow("bundle_item_assigned_twice");
+    const order = service.convertEstimate(owner, estimate.id).order;
+    expect(service.order(owner, order.id).bundles[0].title).toBe("Sign Package");
+    const invoice = service.createOrOpenInvoice(owner, order.id).invoice;
+    expect(service.invoice(owner, invoice.id).bundles[0].title).toBe("Sign Package");
+    service.setInvoiceDocumentStatus(owner, invoice.id, "issued");
+    expect(() => service.saveCommercialBundles(owner, "invoice", invoice.id, { bundles: [] })).toThrow("bundle_document_locked");
+  });
+
+  it("enforces Stage 3 schema invariants for Work Order membership, calendar links, and bundles", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Invariant Order", customer_id: c.id, items: [item({ title: "Production" }), item({ title: "Office", production_required: false })] });
+    const otherOrder = service.createOrder(owner, { title: "Other Order", customer_id: c.id, items: [item({ title: "Other" })] });
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    expect(() => db.prepare("INSERT INTO work_order_items (id, tenant_id, work_order_id, order_item_id, position, active, created_at) VALUES ('bad-non-production', ?, ?, ?, 0, 1, ?)").run(owner.tenant_id, workOrder.id, order.items[1].id, new Date().toISOString())).toThrow(/work_order_item_relationship_invalid/);
+    expect(() => db.prepare("INSERT INTO work_order_items (id, tenant_id, work_order_id, order_item_id, position, active, created_at) VALUES ('bad-cross-order', ?, ?, ?, 0, 1, ?)").run(owner.tenant_id, workOrder.id, otherOrder.items[0].id, new Date().toISOString())).toThrow(/work_order_item_relationship_invalid/);
+    expect(() => service.createCalendarEvent(owner, calendarPayload({ order_id: otherOrder.id, work_order_id: workOrder.id }))).toThrow("invalid_calendar_link");
+    expect(() => service.saveCommercialBundles(owner, "order", order.id, { bundles: [{ title: "Foreign", pricing_mode: "itemized_subtotal", item_ids: [otherOrder.items[0].id] }] })).toThrow("bundle_item_not_found");
+  });
+
+  it("keeps Send to Production transactional and idempotent across retries and failures", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Retry Order", customer_id: c.id, items: [item({ title: "Face" }), item({ title: "Frame" })] });
+    const originalAudit = service.audit;
+    service.audit = () => {
+      throw new Error("forced_audit_failure");
+    };
+    expect(() => service.sendOrderToProduction(owner, order.id, { mode: "whole_order" })).toThrow("forced_audit_failure");
+    service.audit = originalAudit;
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ? AND order_id = ?").get(owner.tenant_id, order.id).count).toBe(0);
+    expect(db.prepare("SELECT sent_to_production_at FROM orders WHERE id = ?").get(order.id).sent_to_production_at).toBe(null);
+    const first = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" });
+    const second = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" });
+    expect(second.already_sent).toBe(true);
+    expect(first.work_orders[0].id).toBe(second.work_orders[0].id);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ? AND order_id = ? AND status = 'active'").get(owner.tenant_id, order.id).count).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_order_items WHERE tenant_id = ? AND active = 1").get(owner.tenant_id).count).toBe(2);
+  });
+
+  it("protects post-release production history and completed Work Order reopen permissions", async () => {
+    const staff = await service.addUser(owner, { display_name: "Shop Staff", email: "shop-staff@example.com", password: "password123", role: "staff" });
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Protected Order", customer_id: c.id, items: [item({ title: "Panel A" }), item({ title: "Panel B" })] });
+    const workOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    const released = service.order(owner, order.id);
+    expect(() => service.updateOrderWorkspace(owner, order.id, { expected_updated_at: released.updated_at, items: [...released.items, item({ title: "Late Add" })] })).toThrow("released_production_item_assignment_required");
+    expect(() => service.updateOrderWorkspace(owner, order.id, { expected_updated_at: released.updated_at, items: released.items.slice(0, 1) })).toThrow("released_production_item_history_protected");
+    expect(() => service.updateOrderWorkspace(owner, order.id, { expected_updated_at: released.updated_at, items: released.items.map((entry, index) => (index === 0 ? { ...entry, production_required: false } : entry)) })).toThrow("released_production_required_change_requires_regroup");
+    expect(() => service.setProductionStage(owner, released.items[0].id, "in_progress")).toThrow("work_order_item_stage_managed_by_work_order");
+    service.setWorkOrderCompletion(owner, workOrder.id, true);
+    expect(() => service.setWorkOrderCompletion(staff, workOrder.id, false)).toThrow("permission_denied");
+    expect(service.setWorkOrderCompletion(owner, workOrder.id, false).work_order.production_stage).toBe("in_progress");
+    expect(service.auditTrail(owner, "work_order", workOrder.id).some((entry) => entry.action === "work_order.reopen")).toBe(true);
+  });
+
+  it("moves future calendar entries to one replacement Work Order without touching order-level schedule entries", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Calendar Move", customer_id: c.id, items: [item({ title: "Panel A" }), item({ title: "Panel B" })] });
+    const oldWorkOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    const workEvent = service.createCalendarEvent(owner, calendarPayload({ title: "Work block", order_id: order.id, work_order_id: oldWorkOrder.id, start_at: "2999-02-01T09:00", end_at: "2999-02-01T10:00" }));
+    const orderEvent = service.createCalendarEvent(owner, calendarPayload({ title: "Customer call", schedule_category: "sales", order_id: order.id, start_at: "2999-02-01T11:00", end_at: "2999-02-01T12:00" }));
+    service.setWorkOrderStage(owner, oldWorkOrder.id, "in_progress");
+    const regrouped = service.regroupOrderProduction(owner, order.id, { mode: "whole_order", reason: "Reissue production packet", calendar_resolution: "move_to_replacement" });
+    const moved = service.calendarEvent(owner, workEvent.id);
+    const untouched = service.calendarEvent(owner, orderEvent.id);
+    expect(moved.work_order_id).toBe(regrouped.work_orders[0].id);
+    expect(untouched.work_order_id).toBe(null);
+    expect(untouched.status).toBe("scheduled");
+    expect(service.auditTrail(owner, "order", order.id).some((entry) => entry.action === "calendar.work_order_resolution")).toBe(true);
+  });
+
+  it("keeps Work Order and bundle APIs tenant-isolated and redacts legacy production item prices for staff", async () => {
+    const staff = await service.addUser(owner, { display_name: "Legacy Staff", email: "legacy-staff@example.com", password: "password123", role: "staff" });
+    const c = customer(owner);
+    const legacy = service.createOrder(owner, { title: "Legacy Board", customer_id: c.id, items: [item({ title: "Legacy Item", unit_price_cents: 7777 })] });
+    expect(JSON.stringify(service.productionBoard(staff))).not.toMatch(/unit_price_cents|line_total_cents|total_cents|payment|pricing|cost|margin/i);
+    const workOrder = service.sendOrderToProduction(owner, legacy.id, { mode: "whole_order" }).work_orders[0];
+    const other = await bootstrap("other-tenant");
+    expect(() => service.workOrderSummary(other.user, workOrder.id)).toThrow("work_order_not_found");
+    expect(() => service.saveCommercialBundles(other.user, "order", legacy.id, { bundles: [{ title: "Foreign", pricing_mode: "itemized_subtotal", item_ids: [legacy.items[0].id] }] })).toThrow("order_not_found");
+  });
+
+  it("uses exact deterministic bundle allocations for totals, taxes, PDFs, and conversion retries", () => {
+    service.updateSettings(owner, { sales_tax_rate_basis_points: 825 });
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, {
+      title: "Ignored",
+      customer_id: c.id,
+      items: [
+        item({ title: "Taxed", quantity_decimal: "1.0000", unit_price_cents: 1000, taxable: true }),
+        item({ title: "Untaxed", quantity_decimal: "1.0000", unit_price_cents: 2000, taxable: false }),
+      ],
+    });
+    const result = service.saveCommercialBundles(owner, "estimate", estimate.id, {
+      bundles: [{ title: "Manual Package", pricing_mode: "bundle_price", manual_total_cents: 1001, override_reason: "Approved package price", show_member_prices: true, item_ids: estimate.items.map((entry) => entry.id) }],
+    });
+    expect(result.items[0].items.reduce((sum, entry) => sum + entry.allocated_cents, 0)).toBe(1001);
+    expect(service.estimate(owner, estimate.id)).toMatchObject({ subtotal_cents: 1001, tax_cents: 27, total_cents: 1028 });
+    const order = service.convertEstimate(owner, estimate.id).order;
+    const retry = service.convertEstimate(owner, estimate.id).order;
+    expect(retry.id).toBe(order.id);
+    expect(service.order(owner, order.id)).toMatchObject({ subtotal_cents: 1001, tax_cents: 27, total_cents: 1028 });
+    const invoice = service.createOrOpenInvoice(owner, order.id).invoice;
+    const invoiceRetry = service.createOrOpenInvoice(owner, order.id).invoice;
+    expect(invoiceRetry.id).toBe(invoice.id);
+    expect(service.invoice(owner, invoice.id)).toMatchObject({ subtotal_cents: 1001, tax_cents: 27, total_cents: 1028, balance_due_cents: 1028 });
+    const pdf = service.documentPdf(owner, "invoice", invoice.id).toString("latin1");
+    expect(pdf).toContain("Manual Package");
+    expect(pdf).toContain("$10.28");
+
+    const zero = service.createEstimate(owner, { title: "Ignored", customer_id: c.id, items: [item({ title: "Zero A", quantity_decimal: "1.0000", unit_price_cents: 0 }), item({ title: "Zero B", quantity_decimal: "1.0000", unit_price_cents: 0 })] });
+    const zeroBundle = service.saveCommercialBundles(owner, "estimate", zero.id, { bundles: [{ title: "Zero Base", pricing_mode: "bundle_price", manual_total_cents: 5, override_reason: "Documented zero base allocation", item_ids: zero.items.map((entry) => entry.id) }] }).items[0];
+    const sortedAllocations = [...zeroBundle.items].sort((a, b) => a.id.localeCompare(b.id)).map((entry) => entry.allocated_cents);
+    expect(sortedAllocations).toEqual([3, 2]);
+  });
+});
+
+describe("Version 1 Part 5 backup export and empty-tenant restore", () => {
+  function seedOperationalData(actor = owner) {
+    const c = customer(actor, { business_name: "Backup Co", internal_notes: "Backup note" });
+    const estimate = service.createEstimate(actor, { title: "Test Order", customer_id: c.id, discount_cents: 100, items: [item({ assigned_user_id: actor.id, internal_note: "Estimate item note" })] });
+    const order = service.convertEstimate(actor, estimate.id).order;
+    const workOrder = service.sendOrderToProduction(actor, order.id, { mode: "whole_order" }).work_orders[0];
+    service.setWorkOrderStage(actor, workOrder.id, "in_progress");
+    const invoice = service.createOrOpenInvoice(actor, order.id).invoice;
+    service.setInvoiceDocumentStatus(actor, invoice.id, "issued");
+    service.recordInvoicePayment(actor, invoice.id, { amount_paid_cents: 500 });
+    service.createCalendarEvent(actor, { title: "Install", order_id: order.id, order_item_id: order.items[0].id, work_order_id: workOrder.id, start_at: "2026-08-22T09:00", end_at: "2026-08-22T10:00", assigned_user_id: actor.id });
+    const attachment = service.uploadOrderAttachment(actor, order.id, {
+      filename: "proof.txt",
+      mime_type: "text/plain",
+      buffer: Buffer.from("backup proof"),
+    });
+    return { c, estimate, order: service.order(actor, order.id), workOrder: service.workOrderSummary(actor, workOrder.id), invoice: service.invoice(actor, invoice.id), attachment };
+  }
+
+  it("requires owner/admin, encrypts data, excludes secrets, and uses unique salt/nonce", async () => {
+    const seeded = seedOperationalData();
+    const staff = await service.addUser(owner, { display_name: "Staff", email: "staff@example.com", password: "password123", role: "staff" });
+    expect(() => service.createBackup(staff, { passphrase: "long-passphrase-1", passphrase_confirmation: "long-passphrase-1" })).toThrow("permission_denied");
+    const first = service.createBackup(owner, { passphrase: "long-passphrase-1", passphrase_confirmation: "long-passphrase-1" });
+    const second = service.createBackup(owner, { passphrase: "long-passphrase-1", passphrase_confirmation: "long-passphrase-1" });
+    const text = first.buffer.toString("utf8");
+    expect(text).toContain("SIGNGUY-SLIM-BACKUP");
+    expect(text).not.toContain("Jane Customer");
+    expect(text).not.toContain("password_hash");
+    expect(text).not.toContain("backup proof");
+    expect(text).not.toContain(seeded.c.email);
+    expect(first.buffer.equals(second.buffer)).toBe(false);
+    expect(first.filename.endsWith(".signguy-backup")).toBe(true);
+  });
+
+  it("validates passphrases, tampering, target emptiness, and preview without mutation", async () => {
+    seedOperationalData();
+    const backup = service.createBackup(owner, { passphrase: "long-passphrase-2", passphrase_confirmation: "long-passphrase-2" });
+    const targetSession = await bootstrap("target-preview");
+    const targetActor = targetSession.user;
+    expect(() => service.previewBackup(targetActor, backupFile(backup), { passphrase: "wrong-passphrase" })).toThrow("backup_decryption_failed");
+    const tampered = Buffer.from(backup.buffer);
+    tampered[tampered.length - 10] = tampered[tampered.length - 10] === 65 ? 66 : 65;
+    expect(() => service.previewBackup(targetActor, backupFile({ buffer: tampered }), { passphrase: "long-passphrase-2" })).toThrow();
+    const before = db.prepare("SELECT COUNT(*) AS count FROM customers WHERE tenant_id = ?").get(targetActor.tenant_id).count;
+    const preview = service.previewBackup(targetActor, backupFile(backup), { passphrase: "long-passphrase-2" });
+    const after = db.prepare("SELECT COUNT(*) AS count FROM customers WHERE tenant_id = ?").get(targetActor.tenant_id).count;
+    expect(before).toBe(0);
+    expect(after).toBe(0);
+    expect(preview.restore_permitted).toBe(true);
+    expect(preview.counts.customers).toBe(1);
+    expect(preview.counts.estimate_items).toBe(1);
+    expect(preview.counts.employee_announcements).toBe(0);
+    expect(preview.counts.employee_announcement_reads).toBe(0);
+    expect(preview.counts.employee_direct_messages).toBe(0);
+    expect(preview.attachment_count).toBe(1);
+    expect(preview.user_mapping[0].matched).toBe(false);
+    customer(targetActor);
+    const blocked = service.previewBackup(targetActor, backupFile(backup), { passphrase: "long-passphrase-2" });
+    expect(blocked.restore_permitted).toBe(false);
+    expect(blocked.blocking_errors.some((entry) => entry.startsWith("customers:"))).toBe(true);
+  });
+
+  it("rejects unsupported crypto headers and malformed authenticated payloads during preview", async () => {
+    const seeded = seedOperationalData();
+    service.createOrder(owner, { title: "Other Backup Order", customer_id: seeded.c.id, items: [item({ title: "Other Item", production_required: false })] });
+    const passphrase = "long-passphrase-4";
+    const backup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const targetSession = await bootstrap("target-malformed");
+    const targetActor = targetSession.user;
+    const expectProductionPayloadRejected = (mutate) => {
+      const payload = refreshManifest(decryptBackup(backup.buffer, passphrase));
+      mutate(payload);
+      refreshManifest(payload);
+      expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(payload, passphrase)), { passphrase })).toThrow("backup_relationship_invalid");
+    };
+    const header = JSON.parse(backup.buffer.toString("utf8"));
+    expect(() => service.previewBackup(targetActor, backupFile({ buffer: Buffer.from(JSON.stringify({ ...header, algorithm: "AES-128-CBC" }), "utf8") }), { passphrase })).toThrow("backup_format_unsupported");
+    expect(() => service.previewBackup(targetActor, backupFile({ buffer: Buffer.from(JSON.stringify({ ...header, kdf_iterations: 1 }), "utf8") }), { passphrase })).toThrow("backup_format_unsupported");
+    expect(() => service.previewBackup(targetActor, backupFile({ buffer: Buffer.from(JSON.stringify({ ...header, tag_b64: Buffer.alloc(16).toString("base64") }), "utf8") }), { passphrase })).toThrow("backup_decryption_failed");
+
+    const checksumPayload = decryptBackup(backup.buffer, passphrase);
+    checksumPayload.data.customers[0].contact_name = "Tampered after manifest";
+    expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(checksumPayload, passphrase)), { passphrase })).toThrow("backup_checksum_mismatch");
+
+    const relationshipPayload = refreshManifest(decryptBackup(backup.buffer, passphrase));
+    relationshipPayload.data.orders[0].customer_id = "missing-customer";
+    refreshManifest(relationshipPayload);
+    expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(relationshipPayload, passphrase)), { passphrase })).toThrow("backup_relationship_invalid");
+
+    expectProductionPayloadRejected((payload) => {
+      payload.data.work_orders[0].tenant_id = "wrong-tenant";
+    });
+    expectProductionPayloadRejected((payload) => {
+      const otherOrder = payload.data.orders.find((entry) => entry.id !== payload.data.work_orders[0].order_id);
+      payload.data.work_orders[0].order_id = otherOrder.id;
+    });
+    expectProductionPayloadRejected((payload) => {
+      payload.data.work_order_items[0].tenant_id = "wrong-tenant";
+    });
+    expectProductionPayloadRejected((payload) => {
+      payload.data.work_order_items.push({ ...payload.data.work_order_items[0], id: "duplicate-active-work-order-item" });
+    });
+    expectProductionPayloadRejected((payload) => {
+      payload.data.order_items.find((entry) => entry.id === payload.data.work_order_items[0].order_item_id).production_required = 0;
+    });
+    expectProductionPayloadRejected((payload) => {
+      payload.data.work_orders[0].status = "cancelled";
+      payload.data.work_order_items[0].active = 1;
+    });
+    expectProductionPayloadRejected((payload) => {
+      payload.data.work_orders[0].completed = payload.data.work_orders[0].production_stage === "complete" ? 0 : 1;
+    });
+
+    const attachmentPayload = refreshManifest(decryptBackup(backup.buffer, passphrase));
+    attachmentPayload.attachments[0].metadata.original_filename = "payload.html";
+    refreshManifest(attachmentPayload);
+    expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(attachmentPayload, passphrase)), { passphrase })).toThrow("backup_attachment_type_unsupported");
+  });
+
+  it("enforces backup permissions, schema compatibility, failure audits, and restore temp cleanup", async () => {
+    seedOperationalData();
+    const passphrase = "long-passphrase-5";
+    const backup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const staff = await service.addUser(owner, { display_name: "Viewer", email: "viewer@example.com", password: "password123", role: "staff" });
+    expect(() => service.previewBackup(staff, backupFile(backup), { passphrase })).toThrow("permission_denied");
+    expect(() => service.restoreBackup(staff, backupFile(backup), { passphrase, confirmation_phrase: "shop-a" })).toThrow("permission_denied");
+
+    const targetSession = await bootstrap("target-schema");
+    const targetActor = targetSession.user;
+    const schemaPayload = refreshManifest(decryptBackup(backup.buffer, passphrase));
+    schemaPayload.manifest.source_schema_version = "999_future_schema.sql";
+    const schemaPreview = service.previewBackup(targetActor, backupFile(encryptedPayload(schemaPayload, passphrase)), { passphrase });
+    expect(schemaPreview.restore_permitted).toBe(false);
+    expect(schemaPreview.blocking_errors).toContain("schema_incompatible");
+
+    expect(() => service.previewBackup(targetActor, backupFile(backup), { passphrase: "wrong-passphrase" })).toThrow("backup_decryption_failed");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE tenant_id = ? AND action = 'backup.validation_failed'").get(targetActor.tenant_id).count).toBe(1);
+
+    const wrongRestore = backupFile(backup);
+    expect(() => service.restoreBackup(targetActor, wrongRestore, { passphrase: "wrong-passphrase", confirmation_phrase: "target-schema" })).toThrow("backup_decryption_failed");
+    expect(existsSync(wrongRestore.cleanup_dir)).toBe(false);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE tenant_id = ? AND action = 'backup.restore_failed'").get(targetActor.tenant_id).count).toBe(1);
+
+    expect(() => service.createBackup(owner, { passphrase: "short", passphrase_confirmation: "short" })).toThrow("backup_passphrase_invalid");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE tenant_id = ? AND action = 'backup.failed'").get(owner.tenant_id).count).toBe(1);
+  });
+
+  it("restores Stage 5-6 backups without Stage 7-8 sections under the current schema", async () => {
+    seedOperationalData();
+    const passphrase = "long-passphrase-legacy";
+    const currentBackup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const legacyPayload = refreshStageSixManifest(decryptBackup(currentBackup.buffer, passphrase));
+    const legacyBackup = encryptedPayload(legacyPayload, passphrase);
+    const targetSession = await bootstrap("target-legacy-stage-six");
+    const targetActor = targetSession.user;
+
+    const preview = service.previewBackup(targetActor, backupFile(legacyBackup), { passphrase });
+    expect(preview.restore_permitted).toBe(true);
+    expect(preview.source_schema_version).toBe("012_v2_stage5_6_time_pay.sql");
+    expect(preview.counts).not.toHaveProperty("work_orders");
+    expect(preview.counts).not.toHaveProperty("work_order_items");
+    expect(preview.counts).not.toHaveProperty("employee_announcements");
+    expect(preview.counts).not.toHaveProperty("employee_announcement_reads");
+    expect(preview.counts).not.toHaveProperty("employee_direct_messages");
+    service.restoreBackup(targetActor, backupFile(legacyBackup), {
+      passphrase,
+      confirmation_phrase: service.tenant(targetActor.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_announcements WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_announcement_reads WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_direct_messages WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM orders WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(0);
+    const restored = service.listOrders(targetActor)[0];
+    expect(restored.production_progress).toEqual({ completed: 0, total: 1, percent: 0 });
+    expect(restored.sent_to_production_at).toBe(null);
+    expect(restored.production_grouping_mode).toBe(null);
+    expect(db.prepare("SELECT work_order_id FROM calendar_events WHERE tenant_id = ?").get(targetActor.tenant_id).work_order_id).toBe(null);
+  });
+
+  it("restores Stage 8 schema 013 backups without Group C Work Order sections", async () => {
+    seedOperationalData();
+    const passphrase = "long-passphrase-stage-eight";
+    const currentBackup = service.createBackup(owner, { passphrase, passphrase_confirmation: passphrase });
+    const legacyPayload = refreshStageEightManifest(decryptBackup(currentBackup.buffer, passphrase));
+    const legacyBackup = encryptedPayload(legacyPayload, passphrase);
+    const targetSession = await bootstrap("target-legacy-stage-eight");
+    const targetActor = targetSession.user;
+
+    const preview = service.previewBackup(targetActor, backupFile(legacyBackup), { passphrase });
+    expect(preview.restore_permitted).toBe(true);
+    expect(preview.source_schema_version).toBe("013_v2_stage7_8_messages_announcements.sql");
+    expect(preview.counts).not.toHaveProperty("work_orders");
+    expect(preview.counts).not.toHaveProperty("work_order_items");
+    expect(preview.counts).toHaveProperty("employee_announcements");
+    expect(preview.counts).toHaveProperty("employee_direct_messages");
+
+    service.restoreBackup(targetActor, backupFile(legacyBackup), {
+      passphrase,
+      confirmation_phrase: service.tenant(targetActor.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+
+    expect(db.prepare("SELECT COUNT(*) AS count FROM orders WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM work_orders WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(0);
+    const restored = service.listOrders(targetActor)[0];
+    expect(restored.items[0]).toMatchObject({ production_stage: "not_started", completed: false, production_state_source: "pre_release" });
+    expect(restored.production_progress).toEqual({ completed: 0, total: 1, percent: 0 });
+    expect(restored.sent_to_production_at).toBe(null);
+    expect(restored.production_grouping_mode).toBe(null);
+    expect(db.prepare("SELECT work_order_id FROM calendar_events WHERE tenant_id = ?").get(targetActor.tenant_id).work_order_id).toBe(null);
+  });
+
+  it("restores into an empty tenant, preserves relationships and attachments, advances sequences, and blocks duplicates", async () => {
+    const seeded = seedOperationalData();
+    const backup = service.createBackup(owner, { passphrase: "long-passphrase-3", passphrase_confirmation: "long-passphrase-3" });
+    const targetSession = await bootstrap("target-restore");
+    const targetActor = targetSession.user;
+    const targetName = service.tenant(targetActor.tenant_id).company_name;
+    expect(() => service.restoreBackup(targetActor, backupFile(backup), { passphrase: "long-passphrase-3", confirmation_phrase: targetName })).toThrow("backup_assignment_policy_required");
+    const report = service.restoreBackup(targetActor, backupFile(backup), {
+      passphrase: "long-passphrase-3",
+      confirmation_phrase: targetName,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+    expect(report.restored_counts.customers).toBe(1);
+    const restoredCustomer = db.prepare("SELECT * FROM customers WHERE tenant_id = ?").get(targetActor.tenant_id);
+    const restoredOrder = db.prepare("SELECT * FROM orders WHERE tenant_id = ?").get(targetActor.tenant_id);
+    const restoredInvoice = db.prepare("SELECT * FROM invoices WHERE tenant_id = ?").get(targetActor.tenant_id);
+    const restoredEvent = db.prepare("SELECT * FROM calendar_events WHERE tenant_id = ?").get(targetActor.tenant_id);
+    const restoredWorkOrder = db.prepare("SELECT * FROM work_orders WHERE tenant_id = ?").get(targetActor.tenant_id);
+    const restoredWorkOrderItem = db.prepare("SELECT * FROM work_order_items WHERE tenant_id = ?").get(targetActor.tenant_id);
+    expect(restoredCustomer.contact_name).toBe(seeded.c.contact_name);
+    expect(restoredInvoice.order_id).toBe(restoredOrder.id);
+    expect(restoredWorkOrder.order_id).toBe(restoredOrder.id);
+    expect(restoredWorkOrder.production_stage).toBe("in_progress");
+    expect(restoredWorkOrder.completed).toBe(0);
+    expect(restoredWorkOrderItem.work_order_id).toBe(restoredWorkOrder.id);
+    expect(restoredEvent.status).toBe("scheduled");
+    expect(restoredEvent.work_order_id).toBe(restoredWorkOrder.id);
+    expect(service.order(targetActor, restoredOrder.id).items[0].production_stage).toBe("in_progress");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_attachments WHERE tenant_id = ? AND deleted_at IS NULL").get(targetActor.tenant_id).count).toBe(1);
+    expect(service.createCustomer(targetActor, { contact_name: "Next", billing_address: address }).customer_number).toBe("C-00002");
+    expect(() => service.restoreBackup(targetActor, backupFile(backup), {
+      passphrase: "long-passphrase-3",
+      confirmation_phrase: service.tenant(targetActor.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    })).toThrow("backup_restore_blocked");
+  });
+});
+
+describe("Version 2 Stage 1 customer communications", () => {
+  it("sends Quote email idempotently with customer-facing filenames and records honest delivery states", async () => {
+    const c = customer(owner);
+    const estimate = service.createEstimate(owner, { title: "Lobby Sign", customer_id: c.id, items: [item()] });
+    const deliveries = [];
+    service.emailTransport = async (payload) => {
+      deliveries.push(payload);
+      return { provider_message_id: "sg-message-1" };
+    };
+    service.updateEmailSettings(owner, { sender_name: "Acme Signs", sender_email: "sales@example.com", sendgrid_verified: true });
+    const payload = {
+      idempotency_key: "estimate-send-001",
+      subject: "Quote ready",
+      body_text: "Please review the quote.",
+      attach_document: true,
+    };
+    const first = await service.sendCustomerEmail(owner, "estimate", estimate.id, payload);
+    const second = await service.sendCustomerEmail(owner, "estimate", estimate.id, payload);
+    expect(first.idempotent).toBe(false);
+    expect(second.idempotent).toBe(true);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0].attachments[0].filename).toBe(`quote-${estimate.estimate_number}.pdf`);
+    expect(deliveries[0].attachments[0].filename).not.toContain("estimate");
+    expect(service.estimate(owner, estimate.id).status).toBe("sent");
+    expect(service.listCommunications(owner, { customer_id: c.id })).toHaveLength(1);
+    const eventResult = service.processSendGridEvents([{ sg_event_id: "event-1", sg_message_id: "sg-message-1", event: "delivered", timestamp: 1893456000 }]);
+    expect(eventResult.processed[0]).toMatchObject({ status: "recorded", delivery_state: "delivered" });
+    expect(service.listCommunications(owner, { customer_id: c.id })[0].delivery_state).toBe("delivered");
+    const duplicateEvent = service.processSendGridEvents([{ sg_event_id: "event-1", sg_message_id: "sg-message-1", event: "delivered" }]);
+    expect(duplicateEvent.processed[0].status).toBe("duplicate");
+  });
+
+  it("requires confirmation for changed recipients and does not mark failed Invoice sends issued", async () => {
+    const c = customer(owner, { email: "saved@example.com" });
+    const order = service.createOrder(owner, { title: "Window Vinyl", customer_id: c.id, items: [item()] });
+    const invoice = service.createOrOpenInvoice(owner, order.id).invoice;
+    service.updateEmailSettings(owner, { sender_name: "Acme Signs", sender_email: "sales@example.com" });
+    await expect(service.sendCustomerEmail(owner, "invoice", invoice.id, {
+      idempotency_key: "invoice-send-001",
+      to_email: "other@example.com",
+      subject: "Invoice",
+      body_text: "Please review.",
+    })).rejects.toThrow("email_changed_recipient_confirmation_required");
+    service.emailTransport = async () => {
+      throw new Error("provider_down");
+    };
+    await expect(service.sendCustomerEmail(owner, "invoice", invoice.id, {
+      idempotency_key: "invoice-send-002",
+      to_email: "saved@example.com",
+      subject: "Invoice",
+      body_text: "Please review.",
+    })).rejects.toThrow("provider_down");
+    expect(service.invoice(owner, invoice.id).document_status).toBe("draft");
+    expect(service.invoice(owner, invoice.id).payment_status).toBe("unpaid");
+    expect(db.prepare("SELECT delivery_state FROM outbound_email_sends WHERE idempotency_key = ?").get("invoice-send-002").delivery_state).toBe("failed");
+  });
+
+  it("adds manual communication notes with same-tenant related-record validation", async () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Wall Sign", customer_id: c.id, items: [item()] });
+    const note = service.createManualCommunication(owner, {
+      customer_id: c.id,
+      channel: "phone",
+      direction: "inbound",
+      subject: "Approved colors",
+      body_text: "Customer confirmed the color palette by phone.",
+      related_entity_type: "order",
+      related_entity_id: order.id,
+    });
+    expect(note.summary).toBe("Approved colors");
+    expect(service.listCommunications(owner, { related_entity_type: "order", related_entity_id: order.id })).toHaveLength(1);
+    const other = await bootstrap("comm-other");
+    const otherCustomer = customer(other.user);
+    const otherOrder = service.createOrder(other.user, { title: "Other", customer_id: otherCustomer.id, items: [item()] });
+    expect(() => service.createManualCommunication(owner, {
+      customer_id: c.id,
+      channel: "phone",
+      body_text: "bad",
+      related_entity_type: "order",
+      related_entity_id: otherOrder.id,
+    })).toThrow("order_not_found");
+  });
+});
+
+describe("Version 2 Stage 2 email Order Intake", () => {
+  it("receives forwarded email only through the tenant intake address and deduplicates provider retries", () => {
+    const settings = service.settings(owner);
+    const payload = {
+      provider_message_id: "mail-001",
+      intake_address: settings.intake_address.full_address,
+      sender_name: "Buyer",
+      sender_email: "buyer@example.com",
+      recipients: [settings.intake_address.full_address],
+      subject: "Need a banner",
+      text_body: "Please quote a 4x8 banner.",
+      attachments: [{ original_filename: "art.pdf", mime_type: "application/pdf", byte_size: 1200, sha256: "a".repeat(64) }],
+    };
+    const first = service.receiveEmailIntake(payload);
+    const second = service.receiveEmailIntake(payload);
+    expect(first.idempotent).toBe(false);
+    expect(second.idempotent).toBe(true);
+    expect(first.item.status).toBe("new");
+    expect(first.item.attachments[0]).toMatchObject({ original_filename: "art.pdf", accepted: true });
+    expect(() => service.receiveEmailIntake({ ...payload, provider_message_id: "mail-002", intake_address: "bad@example.com" })).toThrow("intake_address_not_found");
+  });
+
+  it("removes rejected intake attachment bytes after content validation fails", () => {
+    const settings = service.settings(owner);
+    const payload = {
+      provider_message_id: "mail-invalid-attachment",
+      intake_address: settings.intake_address.full_address,
+      sender_name: "Buyer",
+      sender_email: "buyer@example.com",
+      recipients: [settings.intake_address.full_address],
+      subject: "Bad PDF",
+      text_body: "This attachment claims to be a PDF.",
+      attachments: [{
+        original_filename: "bad.pdf",
+        mime_type: "application/pdf",
+        byte_size: Buffer.byteLength("not a pdf"),
+        sha256: createHash("sha256").update("not a pdf").digest("hex"),
+        content_base64: Buffer.from("not a pdf").toString("base64"),
+      }],
+    };
+
+    const received = service.receiveEmailIntake(payload);
+
+    expect(received.item.attachments[0]).toMatchObject({
+      original_filename: "bad.pdf",
+      accepted: false,
+      rejection_reason: "content_validation_failed",
+    });
+    const stored = db.prepare("SELECT storage_key FROM intake_attachments WHERE source_message_id = ?").get(received.item.source_message_id);
+    expect(stored.storage_key).toBeNull();
+    expect(countFiles(attachmentRoot)).toBe(0);
+  });
+
+  it("matches a Customer and creates exactly one Draft Order from an Intake Item", () => {
+    const intake = service.receiveEmailIntake({
+      provider_message_id: "mail-003",
+      intake_address: service.settings(owner).intake_address.full_address,
+      sender_name: "New Buyer",
+      sender_email: "newbuyer@example.com",
+      recipients: [],
+      subject: "Yard signs",
+      text_body: "I need 20 yard signs.",
+    }).item;
+    const customer = service.createCustomer(owner, { contact_name: "New Buyer", email: "newbuyer@example.com", billing_address: address });
+    service.updateIntakeItem(owner, intake.id, { customer_id: customer.id, assigned_user_id: owner.id, follow_up_at: "2026-09-01", status: "ready_to_create" });
+    const first = service.createDraftOrderFromIntake(owner, intake.id, {});
+    const second = service.createDraftOrderFromIntake(owner, intake.id, {});
+    expect(first.idempotent).toBe(false);
+    expect(second.idempotent).toBe(true);
+    expect(first.order.status).toBe("draft");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM orders WHERE tenant_id = ? AND customer_id = ?").get(owner.tenant_id, customer.id).count).toBe(1);
+    expect(service.intakeItem(owner, intake.id).status).toBe("converted_to_order");
+  });
+
+  it("links Intake Items to existing tenant-owned Orders without creating another Order", async () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Existing Order", customer_id: c.id, items: [item()] });
+    const before = db.prepare("SELECT COUNT(*) AS count FROM orders WHERE tenant_id = ?").get(owner.tenant_id).count;
+    const intake = service.receiveEmailIntake({
+      provider_message_id: "mail-004",
+      intake_address: service.settings(owner).intake_address.full_address,
+      sender_email: "buyer2@example.com",
+      recipients: [],
+      subject: "Add to existing",
+      text_body: "This belongs with the open order.",
+      attachments: [{
+        original_filename: "notes.txt",
+        mime_type: "text/plain",
+        byte_size: Buffer.byteLength("field notes"),
+        sha256: createHash("sha256").update("field notes").digest("hex"),
+        content_base64: Buffer.from("field notes").toString("base64"),
+      }],
+    }).item;
+    const linked = service.linkIntakeToOrder(owner, intake.id, { order_id: order.id });
+    expect(linked.item.status).toBe("attached_to_existing_order");
+    expect(linked.item.linked_order_id).toBe(order.id);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM orders WHERE tenant_id = ?").get(owner.tenant_id).count).toBe(before);
+    expect(service.listOrderAttachments(owner, order.id)[0].original_filename).toBe("notes.txt");
+    const other = await bootstrap("intake-other");
+    const otherCustomer = customer(other.user);
+    const otherOrder = service.createOrder(other.user, { title: "Other", customer_id: otherCustomer.id, items: [item()] });
+    expect(() => service.linkIntakeToOrder(owner, intake.id, { order_id: otherOrder.id })).toThrow("order_not_found");
+  });
+
+  it("removes copied intake attachment bytes when post-copy image validation fails", () => {
+    const pngHeaderOnly = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const intake = service.receiveEmailIntake({
+      provider_message_id: "mail-truncated-image",
+      intake_address: service.settings(owner).intake_address.full_address,
+      sender_email: "buyer3@example.com",
+      recipients: [],
+      subject: "Broken image",
+      text_body: "This image has only a PNG header.",
+      attachments: [{
+        original_filename: "broken.png",
+        mime_type: "image/png",
+        byte_size: pngHeaderOnly.length,
+        sha256: createHash("sha256").update(pngHeaderOnly).digest("hex"),
+        content_base64: pngHeaderOnly.toString("base64"),
+      }],
+    }).item;
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Copy Failure Order", customer_id: c.id, items: [item()] });
+
+    expect(() => service.linkIntakeToOrder(owner, intake.id, { order_id: order.id })).toThrow("attachment_type_not_allowed");
+
+    expect(db.prepare("SELECT COUNT(*) AS count FROM order_attachments WHERE order_id = ?").get(order.id).count).toBe(0);
+    expect(countFiles(join(attachmentRoot, owner.tenant_id, order.id))).toBe(0);
+  });
+});
+
+describe("Version 2 Stages 3-4 camera capture and photo annotation", () => {
+  it("stores captured photos through the private attachment pipeline with device-capture audit metadata", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Camera Order", customer_id: c.id, items: [item()] });
+    const attachment = service.uploadOrderAttachment(owner, order.id, {
+      filename: "../field-photo.png",
+      mime_type: "image/png",
+      buffer: tinyPng(),
+      fields: { source_type: "device_capture" },
+    });
+
+    expect(attachment).toMatchObject({
+      original_filename: "field-photo.png",
+      source_type: "device_capture",
+      annotatable: true,
+      image_width: 1,
+      image_height: 1,
+    });
+    expect(attachment).not.toHaveProperty("storage_key");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'attachment.device_capture' AND actor_user_id = ?").get(owner.id).count).toBe(1);
+  });
+
+  it("creates separate annotated derivatives without changing original bytes or overwriting prior derivatives", () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Annotated Order", customer_id: c.id, items: [item()] });
+    const original = service.uploadOrderAttachment(owner, order.id, {
+      filename: "original.png",
+      mime_type: "image/png",
+      buffer: tinyPng(),
+    });
+    const originalRow = db.prepare("SELECT * FROM order_attachments WHERE id = ?").get(original.id);
+    const originalBytes = readFileSync(service.attachmentPath(originalRow.storage_key));
+
+    const first = service.createAnnotatedAttachment(owner, order.id, original.id, {
+      filename: "annotated-one.png",
+      mime_type: "image/png",
+      buffer: tinyPng(),
+      fields: { annotation_json: JSON.stringify(annotationOps()) },
+    });
+    const second = service.createAnnotatedAttachment(owner, order.id, original.id, {
+      filename: "annotated-two.png",
+      mime_type: "image/png",
+      buffer: tinyPng(),
+      fields: { annotation_json: JSON.stringify(annotationOps({ id: "op-2", color: "#2563eb" })) },
+    });
+
+    expect(first.id).not.toBe(second.id);
+    expect(first).toMatchObject({
+      source_type: "annotation_derivative",
+      original_attachment_id: original.id,
+      derivative_type: "annotation",
+      image_width: 1,
+      image_height: 1,
+    });
+    expect(first.annotation_operations[0]).toMatchObject({ type: "rectangle", start: { x: 0.1, y: 0.1 } });
+    expect(service.listOrderAttachments(owner, order.id).filter((entry) => entry.original_attachment_id === original.id)).toHaveLength(2);
+    const refreshedOriginalRow = db.prepare("SELECT * FROM order_attachments WHERE id = ?").get(original.id);
+    expect(readFileSync(service.attachmentPath(refreshedOriginalRow.storage_key))).toEqual(originalBytes);
+    expect(refreshedOriginalRow.sha256).toBe(originalRow.sha256);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'attachment.annotation_create' AND actor_user_id = ?").get(owner.id).count).toBe(2);
+  });
+
+  it("rejects unauthorized, cross-order, cross-tenant, non-image, malformed, and excessive annotation attempts", async () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Reject Order", customer_id: c.id, items: [item()] });
+    const otherSameTenantOrder = service.createOrder(owner, { title: "Other Same Tenant", customer_id: c.id, items: [item()] });
+    const image = service.uploadOrderAttachment(owner, order.id, { filename: "proof.png", mime_type: "image/png", buffer: tinyPng() });
+    const text = service.uploadOrderAttachment(owner, order.id, { filename: "notes.txt", mime_type: "text/plain", buffer: Buffer.from("notes") });
+    const payload = { filename: "marked.png", mime_type: "image/png", buffer: tinyPng(), fields: { annotation_json: JSON.stringify(annotationOps()) } };
+
+    expect(() => service.createAnnotatedAttachment({ ...owner, role: "viewer" }, order.id, image.id, payload)).toThrow("permission_denied");
+    expect(() => service.createAnnotatedAttachment(owner, otherSameTenantOrder.id, image.id, payload)).toThrow("attachment_not_found");
+    const other = await bootstrap("annotation-other");
+    const otherCustomer = customer(other.user);
+    const otherOrder = service.createOrder(other.user, { title: "Other Tenant", customer_id: otherCustomer.id, items: [item()] });
+    expect(() => service.createAnnotatedAttachment(owner, otherOrder.id, image.id, payload)).toThrow("order_not_found");
+    expect(() => service.createAnnotatedAttachment(owner, order.id, text.id, payload)).toThrow("annotation_source_not_image");
+    expect(() => service.createAnnotatedAttachment(owner, order.id, image.id, { ...payload, fields: { annotation_json: "{}" } })).toThrow("annotation_payload_invalid");
+    expect(() => service.createAnnotatedAttachment(owner, order.id, image.id, { ...payload, fields: { annotation_json: " ".repeat(130 * 1024) } })).toThrow("annotation_payload_too_large");
+  });
+});
+
+describe("Version 2 Stages 5-6 employee time and weekly pay", () => {
+  async function employeeFixture({ rate = 1500, effective = "2026-08-15", role = "staff", payAccess = false } = {}) {
+    const user = await service.addUser(owner, { display_name: "Employee User", email: `employee-${randomBytes(3).toString("hex")}@example.com`, password: "password123", role });
+    const employee = service.createEmployee(owner, {
+      user_id: user.id,
+      name: user.display_name,
+      email: user.email,
+      phone: "555-0199",
+      role,
+      portal_access_enabled: true,
+      pay_management_enabled: payAccess,
+      active: true,
+      hire_date: effective,
+      hourly_rate_cents: rate,
+      rate_effective_date: effective,
+      internal_note: "Crew member",
+    });
+    return { user, employee };
+  }
+
+  it("keeps employee mutation and audit timestamps on one monotonic clock", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2300-01-01T00:00:00.000Z"));
+    const user = await service.addUser(owner, { display_name: "Timestamp Staff", email: "timestamp-staff@example.com", password: "password123", role: "staff" });
+    const employee = service.createEmployee(owner, {
+      user_id: user.id,
+      name: "Timestamp Staff",
+      email: user.email,
+      role: "staff",
+      hourly_rate_cents: 1800,
+      rate_effective_date: "2300-01-01",
+    });
+    const rate = db.prepare("SELECT * FROM employee_rates WHERE tenant_id = ? AND employee_id = ?").get(owner.tenant_id, employee.id);
+    const audits = db
+      .prepare("SELECT action, occurred_at FROM audit_events WHERE tenant_id = ? AND entity_id = ? AND action IN ('employee.rate_create', 'employee.create') ORDER BY occurred_at")
+      .all(owner.tenant_id, employee.id);
+
+    expect(audits.map((entry) => entry.action)).toEqual(["employee.rate_create", "employee.create"]);
+    const timestamps = [employee.created_at, rate.created_at, ...audits.map((entry) => entry.occurred_at)];
+    expect(new Set(timestamps).size).toBe(timestamps.length);
+    expect(timestamps).toEqual([...timestamps].sort());
+  });
+
+  it("links employees to same-tenant users, rejects duplicate active links, enforces portal state, and keeps pay permission explicit", async () => {
+    const { user, employee } = await employeeFixture();
+    expect(employee.user_id).toBe(user.id);
+    expect(employee.current_rate_cents).toBe(1500);
+    expect(() => service.createEmployee(owner, { user_id: user.id, name: "Dup", email: "dup@example.com", role: "staff" })).toThrow("employee_user_already_linked");
+    const other = await bootstrap("foreign-employee");
+    expect(() => service.createEmployee(owner, { user_id: other.user.id, name: "Foreign", email: "foreign@example.com", role: "staff" })).toThrow("employee_user_tenant_mismatch");
+
+    const manager = await service.addUser(owner, { display_name: "Manager", email: "manager-pay@example.com", password: "password123", role: "manager" });
+    const managerEmployee = service.createEmployee(owner, { user_id: manager.id, name: "Manager", email: manager.email, role: "manager", hourly_rate_cents: 2200, rate_effective_date: "2026-08-15" });
+    expect(() => service.paySummary(manager, employee.id, "2026-08-15")).toThrow("pay_permission_required");
+    expect(service.listEmployees(manager).find((entry) => entry.id === employee.id).current_rate_cents).toBeUndefined();
+    service.updateEmployee(owner, managerEmployee.id, { pay_management_enabled: true });
+    expect(service.paySummary(manager, employee.id, "2026-08-15").week.label).toBe("Internal Pay Summary");
+
+    service.updateEmployee(owner, employee.id, { portal_access_enabled: false });
+    expect(() => service.currentTimeClock(user)).toThrow("employee_portal_disabled");
+    service.updateEmployee(owner, employee.id, { portal_access_enabled: true, active: false });
+    expect(() => service.clockIn(user, { at: "2026-08-16T08:00", note: "start" })).toThrow("employee_inactive");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_rates WHERE employee_id = ?").get(employee.id).count).toBe(1);
+  });
+
+  it("lets pay-enabled staff use payroll summaries without employee-management rights", async () => {
+    const { user: payStaff, employee } = await employeeFixture({ payAccess: true });
+    const { user: regularStaff } = await employeeFixture();
+    const manager = await service.addUser(owner, { display_name: "No Pay Manager", email: "no-pay-manager@example.com", password: "password123", role: "manager" });
+
+    expect(service.sessionPayload(payStaff).capabilities.can_manage_pay).toBe(true);
+    expect(service.listPayrollEmployees(payStaff).map((entry) => entry.id)).toContain(employee.id);
+    expect(service.listPayrollEmployees(payStaff)[0]).toEqual(expect.objectContaining({
+      id: expect.any(String),
+      employee_number: expect.any(String),
+      name: expect.any(String),
+      active: expect.any(Boolean),
+    }));
+    expect(service.listPayrollEmployees(payStaff)[0]).not.toHaveProperty("internal_note");
+    expect(service.paySummary(payStaff, employee.id, "2026-08-15").week.label).toBe("Internal Pay Summary");
+    expect(() => service.listEmployees(payStaff)).toThrow("permission_denied");
+    expect(() => service.createEmployee(payStaff, { user_id: manager.id, name: "Nope", email: "nope@example.com", role: "staff" })).toThrow("permission_denied");
+    expect(() => service.updateEmployee(payStaff, employee.id, { active: false })).toThrow("permission_denied");
+
+    expect(service.sessionPayload(regularStaff).capabilities.can_manage_pay).toBe(false);
+    expect(() => service.listPayrollEmployees(regularStaff)).toThrow("pay_permission_required");
+    expect(() => service.listPayrollEmployees(manager)).toThrow("pay_permission_required");
+    expect(service.listPayrollEmployees(owner).map((entry) => entry.id)).toContain(employee.id);
+  });
+
+  it("handles overnight and DST duration, admin corrections, overlap rejection, and void totals", async () => {
+    const { employee } = await employeeFixture({ effective: "2026-01-01" });
+    service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-16T22:00", clock_out_at: "2026-08-17T02:30", clock_in_note: "install", clock_out_note: "done", reason: "paper time card" });
+    const weekEntries = service.listTimeEntries(owner, { employee_id: employee.id, week_start_date: "2026-08-15" });
+    expect(weekEntries.week.week_start_date).toBe("2026-08-15");
+    expect(weekEntries.entries.find((entry) => entry.status === "closed").duration_minutes).toBe(270);
+    const reviewer = await service.addUser(owner, { display_name: "Time Reviewer", email: "time-reviewer@example.com", password: "password123", role: "manager" });
+    const reviewerEntries = service.listTimeEntries(reviewer, { employee_id: employee.id, week_start_date: "2026-08-15" });
+    expect(reviewerEntries.entries[0].rate_cents_snapshot).toBeUndefined();
+    expect(() => service.paySummary(reviewer, employee.id, "2026-08-15")).toThrow("pay_permission_required");
+    expect(() => service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-17T01:00", clock_out_at: "2026-08-17T03:00", reason: "duplicate overlap" })).toThrow("time_entry_overlap");
+
+    const dst = service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-03-08T01:30", clock_out_at: "2026-03-08T03:30", reason: "DST check" });
+    expect(dst.duration_minutes).toBe(60);
+    const long = service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-18T00:00", clock_out_at: "2026-08-18T18:30", reason: "missed close" });
+    expect(long.implausible).toBe(true);
+    const corrected = service.updateTimeEntry(owner, long.id, { clock_out_at: "2026-08-18T10:00", reason: "Actual clock-out found" });
+    expect(corrected.duration_minutes).toBe(600);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'time.entry_correct' AND actor_user_id = ?").get(owner.id).count).toBe(1);
+    service.voidTimeEntry(owner, corrected.id, { reason: "Duplicate paper entry" });
+    const summary = service.paySummary(owner, employee.id, "2026-08-15");
+    expect(summary.week.valid_minutes).toBe(270);
+    expect(summary.week.gross_pay_cents).toBe(6750);
+  });
+
+  it("uses authoritative server time for employee portal punches and keeps duplicate clicks idempotent", async () => {
+    const { user, employee } = await employeeFixture({ effective: "2000-01-01" });
+    const attemptedClockIn = "2026-08-16T08:00:00.000Z";
+    const beforeClockIn = Date.now();
+    const first = service.clockIn(user, { at: attemptedClockIn, note: "install" });
+    const open = db.prepare("SELECT * FROM employee_time_entries WHERE employee_id = ? AND status = 'open'").get(employee.id);
+    expect(first.idempotent).toBe(false);
+    expect(open.clock_in_note).toBe("install");
+    expect(open.clock_in_at).not.toBe(attemptedClockIn);
+    expect(new Date(open.clock_in_at).getTime()).toBeGreaterThanOrEqual(beforeClockIn);
+    expect(service.clockIn(user, { at: "2099-01-01T00:00:00.000Z" }).idempotent).toBe(true);
+
+    const beforeClockOut = Date.now();
+    service.clockOut(user, { at: "2099-01-01T00:00:00.000Z", note: "done" });
+    const closed = db.prepare("SELECT * FROM employee_time_entries WHERE id = ?").get(open.id);
+    expect(closed.status).toBe("closed");
+    expect(closed.clock_out_note).toBe("done");
+    expect(closed.clock_out_at).not.toBe("2099-01-01T00:00:00.000Z");
+    expect(new Date(closed.clock_out_at).getTime()).toBeGreaterThanOrEqual(beforeClockOut);
+    expect(new Date(closed.clock_out_at).getTime()).toBeLessThan(Date.now() + 5000);
+    expect(service.clockOut(user, { at: "2099-01-01T00:00:00.000Z" }).idempotent).toBe(true);
+  });
+
+  it("lets managers void open entries without leaving constraint failures", async () => {
+    const { user, employee } = await employeeFixture({ effective: "2000-01-01" });
+    service.clockIn(user, { note: "wrong employee" });
+    const open = db.prepare("SELECT * FROM employee_time_entries WHERE employee_id = ? AND status = 'open'").get(employee.id);
+
+    const voided = service.voidTimeEntry(owner, open.id, { reason: "Wrong employee selected" });
+
+    expect(voided.status).toBe("void");
+    expect(voided.clock_out_at).toBeTruthy();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_time_entries WHERE employee_id = ? AND status = 'open'").get(employee.id).count).toBe(0);
+  });
+
+  it("blocks closing a pay week with an open entry before mutating the week or carryover", async () => {
+    const { user, employee } = await employeeFixture({ effective: "2000-01-01" });
+    const clock = service.clockIn(user, { note: "still working" });
+    const weekStart = clock.week.week_start_date;
+    const nextStart = addDays(clock.week.week_end_date, 1);
+
+    expect(() => service.closePayWeek(owner, employee.id, weekStart)).toThrow("pay_week_has_open_time_entry");
+
+    const week = db.prepare("SELECT * FROM employee_pay_weeks WHERE tenant_id = ? AND employee_id = ? AND week_start_date = ?").get(owner.tenant_id, employee.id, weekStart);
+    expect(week.status).toBe("open");
+    expect(week.closed_at).toBeNull();
+    expect(week.closing_carryover_cents).toBeNull();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_pay_weeks WHERE tenant_id = ? AND employee_id = ? AND week_start_date = ?").get(owner.tenant_id, employee.id, nextStart).count).toBe(0);
+  });
+
+  it("keeps voided time out of pay totals by rejecting ordinary correction of voided entries", async () => {
+    const { employee } = await employeeFixture({ rate: 6000, effective: "2026-08-15" });
+    const entry = service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-16T08:00", clock_out_at: "2026-08-16T10:00", reason: "paper time card" });
+    service.voidTimeEntry(owner, entry.id, { reason: "Duplicate entry" });
+    expect(service.paySummary(owner, employee.id, "2026-08-15").week.valid_minutes).toBe(0);
+
+    expect(() => service.updateTimeEntry(owner, entry.id, { clock_out_at: "2026-08-16T11:00", reason: "Should not restore" })).toThrow("time_entry_voided");
+
+    const summary = service.paySummary(owner, employee.id, "2026-08-15");
+    expect(summary.week.valid_minutes).toBe(0);
+    expect(summary.week.gross_pay_cents).toBe(0);
+    expect(db.prepare("SELECT status FROM employee_time_entries WHERE id = ?").get(entry.id).status).toBe("void");
+  });
+
+  it("calculates Saturday-Friday weekly pay with rate snapshots, ledger records, close, reopen, and downstream carryover", async () => {
+    const { employee } = await employeeFixture({ rate: 1500, effective: "2026-08-15" });
+    service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-16T08:00", clock_out_at: "2026-08-16T12:00", reason: "paper time card" });
+    service.addEmployeeRate(owner, employee.id, { hourly_rate_cents: 2000, effective_date: "2026-08-18", note: "raise" });
+    const manualEntry = service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-19T09:00", clock_out_at: "2026-08-19T11:00", reason: "missed entry" });
+    service.recordPayAdvance(owner, { employee_id: employee.id, pay_week_start: "2026-08-15", amount_cents: 1000, advance_date: "2026-08-18", note: "Fuel advance" });
+    service.recordPayAdjustment(owner, { employee_id: employee.id, pay_week_start: "2026-08-15", direction: "positive", amount_cents: 250, reason: "Bonus" });
+    service.recordPayAdjustment(owner, { employee_id: employee.id, pay_week_start: "2026-08-15", direction: "negative", amount_cents: 125, reason: "Reimbursement correction" });
+    service.recordManualPayment(owner, { employee_id: employee.id, pay_week_start: "2026-08-15", amount_cents: 2000, payment_date: "2026-08-21", method: "cash", reference: "cash-1" });
+    const open = service.paySummary(owner, employee.id, "2026-08-15");
+    expect(open.week.week_start_date).toBe("2026-08-15");
+    expect(open.week.payday_date).toBe("2026-08-21");
+    expect(open.week.valid_minutes).toBe(360);
+    expect(open.week.gross_pay_cents).toBe(10000);
+    expect(open.week.rate_breakdown).toHaveLength(2);
+    expect(open.week.estimated_amount_due_cents).toBe(7125);
+
+    const closed = service.closePayWeek(owner, employee.id, "2026-08-15");
+    expect(closed.week.status).toBe("closed");
+    expect(closed.week.closing_carryover_cents).toBe(7125);
+    expect(service.paySummary(owner, employee.id, "2026-08-22").week.opening_carryover_cents).toBe(7125);
+    expect(() => service.recordPayAdvance(owner, { employee_id: employee.id, pay_week_start: "2026-08-15", amount_cents: 100, advance_date: "2026-08-20", note: "late" })).toThrow("pay_week_closed");
+    expect(() => service.updateTimeEntry(owner, manualEntry.id, { clock_out_at: "2026-08-19T12:00", reason: "late correction" })).toThrow("pay_week_closed");
+    expect(db.prepare("SELECT duration_minutes FROM employee_time_entries WHERE id = ?").get(manualEntry.id).duration_minutes).toBe(120);
+
+    service.reopenPayWeek(owner, employee.id, "2026-08-15", { reason: "Review correction" });
+    service.recordPayAdjustment(owner, { employee_id: employee.id, pay_week_start: "2026-08-15", direction: "negative", amount_cents: 125, reason: "Correction after review" });
+    expect(service.paySummary(owner, employee.id, "2026-08-15").week.estimated_amount_due_cents).toBe(7000);
+    expect(service.paySummary(owner, employee.id, "2026-08-22").week.opening_carryover_cents).toBe(7000);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_pay_weeks WHERE employee_id = ? AND week_start_date = '2026-08-22'").get(employee.id).count).toBe(1);
+  });
+
+  it("allocates closed shifts only to the minutes overlapping each Saturday-Friday pay week", async () => {
+    const { employee } = await employeeFixture({ rate: 6000, effective: "2026-08-15" });
+    const within = service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-20T09:00", clock_out_at: "2026-08-20T11:00", reason: "same week" });
+    const crossing = service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-21T23:00", clock_out_at: "2026-08-22T02:00", reason: "crosses pay week" });
+    const exactBoundary = service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-28T22:00", clock_out_at: "2026-08-29T00:00", reason: "ends at boundary" });
+
+    const firstWeek = service.paySummary(owner, employee.id, "2026-08-15");
+    const secondWeek = service.paySummary(owner, employee.id, "2026-08-22");
+    const thirdWeek = service.paySummary(owner, employee.id, "2026-08-29");
+
+    expect(firstWeek.week.valid_minutes).toBe(180);
+    expect(firstWeek.week.gross_pay_cents).toBe(18000);
+    expect(firstWeek.week.rate_breakdown).toEqual([{ hourly_rate_cents: 6000, minutes: 180, gross_pay_cents: 18000, hours_decimal: "3.00" }]);
+    expect(secondWeek.week.valid_minutes).toBe(240);
+    expect(secondWeek.week.gross_pay_cents).toBe(24000);
+    expect(thirdWeek.week.valid_minutes).toBe(0);
+    expect(firstWeek.week.valid_minutes + secondWeek.week.valid_minutes + thirdWeek.week.valid_minutes).toBe(within.duration_minutes + crossing.duration_minutes + exactBoundary.duration_minutes);
+  });
+
+  it("rejects closing an earlier open week after a downstream week is already closed", async () => {
+    const { employee } = await employeeFixture({ rate: 6000, effective: "2026-08-15" });
+    service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-23T09:00", clock_out_at: "2026-08-23T10:00", reason: "later week" });
+    service.closePayWeek(owner, employee.id, "2026-08-22");
+
+    expect(() => service.closePayWeek(owner, employee.id, "2026-08-15")).toThrow("downstream_closed_pay_week_requires_manual_reopen");
+    expect(service.paySummary(owner, employee.id, "2026-08-15").week.status).toBe("open");
+  });
+
+  it("limits employees to their own portal time and My Pay records", async () => {
+    const first = await employeeFixture({ rate: 1500, effective: "2026-08-15" });
+    const second = await employeeFixture({ rate: 3000, effective: "2026-08-15" });
+    service.addTimeEntry(owner, { employee_id: first.employee.id, clock_in_at: "2026-08-16T08:00", clock_out_at: "2026-08-16T09:00", reason: "paper time card" });
+    service.addTimeEntry(owner, { employee_id: second.employee.id, clock_in_at: "2026-08-16T08:00", clock_out_at: "2026-08-16T10:00", reason: "paper time card" });
+    expect(service.myPaySummary(first.user, "2026-08-15").employee.id).toBe(first.employee.id);
+    expect(service.myPaySummary(first.user, "2026-08-15").week.gross_pay_cents).toBe(1500);
+    expect(service.currentTimeClock(first.user).entries.every((entry) => entry.employee_id === first.employee.id)).toBe(true);
+  });
+
+  it("exports and restores employee time and pay records with safe user and employee remapping", async () => {
+    const { user, employee } = await employeeFixture({ rate: 1800, effective: "2026-08-15" });
+    service.addTimeEntry(owner, { employee_id: employee.id, clock_in_at: "2026-08-16T08:00", clock_out_at: "2026-08-16T10:00", reason: "paper time card" });
+    service.recordPayAdvance(owner, { employee_id: employee.id, pay_week_start: "2026-08-15", amount_cents: 500, advance_date: "2026-08-17", note: "Materials" });
+    service.closePayWeek(owner, employee.id, "2026-08-15");
+    const backup = service.createBackup(owner, { passphrase: "long-passphrase-6", passphrase_confirmation: "long-passphrase-6" });
+    const payload = decryptBackup(backup.buffer, "long-passphrase-6");
+    expect(payload.data.employees).toHaveLength(1);
+    expect(payload.data.employee_time_entries).toHaveLength(1);
+    expect(payload.data.employee_pay_advances).toHaveLength(1);
+
+    const targetSession = await bootstrap("target-employee-restore");
+    const targetActor = targetSession.user;
+    await service.addUser(targetActor, { display_name: user.display_name, email: user.email, password: "password123", role: user.role });
+    const preview = service.previewBackup(targetActor, backupFile(backup), { passphrase: "long-passphrase-6" });
+    expect(preview.restore_permitted).toBe(true);
+    service.restoreBackup(targetActor, backupFile(backup), {
+      passphrase: "long-passphrase-6",
+      confirmation_phrase: service.tenant(targetActor.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employees WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_time_entries WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_pay_weeks WHERE tenant_id = ?").get(targetActor.tenant_id).count).toBe(2);
+
+    const malformed = refreshManifest(payload);
+    malformed.data.employees[0].tenant_id = "wrong-tenant";
+    refreshManifest(malformed);
+    expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(malformed, "long-passphrase-6")), { passphrase: "long-passphrase-6" })).toThrow("backup_relationship_invalid");
+  });
+});
+
+describe("Version 2 Stages 7-8 employee announcements and messages", () => {
+  async function employeeFixture({ display = "Employee User", role = "staff", active = true, portalAccess = true } = {}) {
+    const token = randomBytes(3).toString("hex");
+    const user = await service.addUser(owner, { display_name: display, email: `${display.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${token}@example.com`, password: "password123", role, active });
+    const employee = service.createEmployee(owner, {
+      user_id: user.id,
+      name: display,
+      email: user.email,
+      role,
+      portal_access_enabled: portalAccess,
+      active,
+      hourly_rate_cents: 1500,
+      rate_effective_date: "2026-08-15",
+    });
+    return { user, employee };
+  }
+
+  it("limits announcements by role, publish window, archive state, and employee read identity", async () => {
+    const staff = await employeeFixture({ display: "Portal Staff" });
+    const otherStaff = await employeeFixture({ display: "Portal Staff Two" });
+    const manager = await employeeFixture({ display: "Portal Manager", role: "manager" });
+    const all = service.createAnnouncement(owner, { title: "All Hands", body: "Meet at 8.", publish_at: "2020-01-01T08:00", audience_role: "all" });
+    const managerOnly = service.createAnnouncement(owner, { title: "Managers", body: "Manager notes.", publish_at: "2020-01-01T09:00", audience_role: "manager" });
+    service.createAnnouncement(owner, { title: "Future", body: "Later.", publish_at: "2099-01-01T08:00", audience_role: "all" });
+    service.createAnnouncement(owner, { title: "Expired", body: "Old.", publish_at: "2020-01-01T08:00", expires_at: "2020-01-02T08:00", audience_role: "all" });
+    const archived = service.createAnnouncement(owner, { title: "Archived", body: "Hidden.", publish_at: "2020-01-01T08:00", audience_role: "all" });
+    service.archiveAnnouncement(owner, archived.id);
+    expect(() => service.updateAnnouncement(owner, archived.id, { title: "Archived Changed" })).toThrow("announcement_archived");
+    expect(service.announcement(owner, archived.id).title).toBe("Archived");
+
+    expect(() => service.createAnnouncement(staff.user, { title: "No", body: "No" })).toThrow("permission_denied");
+    expect(() => service.announcement(staff.user, all.id)).toThrow("permission_denied");
+    expect(() => service.createAnnouncement(owner, { title: "Bad dates", body: "No", publish_at: "2026-08-22T10:00", expires_at: "2026-08-22T09:00" })).toThrow("announcement_date_invalid");
+    expect(service.portalAnnouncements(staff.user).items.map((item) => item.title)).toEqual(["All Hands"]);
+    expect(service.portalAnnouncements(manager.user).items.map((item) => item.title)).toEqual(["Managers", "All Hands"]);
+
+    const detail = service.portalAnnouncement(staff.user, all.id);
+    expect(detail.read_at).toBeTruthy();
+    expect(service.portalAnnouncements(staff.user).items.find((item) => item.id === all.id).unread).toBe(false);
+    expect(service.portalAnnouncements(otherStaff.user).items.find((item) => item.id === all.id).unread).toBe(true);
+    expect(() => service.portalAnnouncement(staff.user, managerOnly.id)).toThrow("announcement_not_found");
+    service.portalAnnouncement(staff.user, all.id);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM employee_announcement_reads WHERE tenant_id = ? AND announcement_id = ? AND employee_id = ?").get(owner.tenant_id, all.id, staff.employee.id).count).toBe(1);
+
+    const updated = service.updateAnnouncement(owner, all.id, { title: "All Hands Updated" });
+    expect(updated.title).toBe("All Hands Updated");
+    const auditDiff = JSON.parse(db.prepare("SELECT diff_json FROM audit_events WHERE action = 'announcement.update' AND entity_id = ? ORDER BY occurred_at DESC LIMIT 1").get(all.id).diff_json);
+    expect(auditDiff.before.body).toBe("Meet at 8.");
+    expect(auditDiff.after.title).toBe("All Hands Updated");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE tenant_id = ? AND actor_user_id = ? AND action IN ('announcement.create', 'announcement.update', 'announcement.archive')").get(owner.tenant_id, owner.id).count).toBe(7);
+  });
+
+  it("applies announcement publish and expiration boundaries consistently", async () => {
+    const staff = await employeeFixture({ display: "Boundary Staff" });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2200-01-01T12:00:00.000Z"));
+    const current = "2200-01-01T12:00:00.000Z";
+    const past = "2199-12-31T12:00:00.000Z";
+    const future = "2200-01-01T12:00:01.000Z";
+    const rows = [
+      ["publish-equal", "Publish Equal", current, null],
+      ["publish-future", "Publish Future", future, null],
+      ["no-expiration", "No Expiration", past, null],
+      ["expiration-future", "Expiration Future", past, future],
+      ["expiration-equal", "Expiration Equal", past, current],
+      ["expired", "Expired", past, "2199-12-31T12:00:01.000Z"],
+    ];
+    for (const [id, title, publishAt, expiresAt] of rows) {
+      db.prepare(
+        `INSERT INTO employee_announcements
+         (id, portable_id, tenant_id, author_user_id, title, body, publish_at, expires_at, audience_role, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'all', ?, ?)`,
+      ).run(id, `portable-${id}`, owner.tenant_id, owner.id, title, "Boundary check.", publishAt, expiresAt, past, past);
+    }
+
+    const visibleTitles = service.portalAnnouncements(staff.user).items.map((item) => item.title);
+    expect(visibleTitles).toEqual(expect.arrayContaining(["Publish Equal", "Expiration Future", "No Expiration"]));
+    expect(visibleTitles).not.toEqual(expect.arrayContaining(["Publish Future", "Expiration Equal", "Expired"]));
+    expect(() => service.createAnnouncement(owner, { title: "Equal dates", body: "No", publish_at: "2200-01-01T12:00", expires_at: "2200-01-01T12:00" })).toThrow("announcement_date_invalid");
+  });
+
+  it("keeps one-to-one employee messages tenant-scoped, active, and recipient-owned for read state", async () => {
+    const alpha = await employeeFixture({ display: "Alpha Installer" });
+    const beta = await employeeFixture({ display: "Beta Designer" });
+    const other = await bootstrap("message-other");
+    service.createEmployee(other.user, {
+      user_id: other.user.id,
+      name: "Other Tenant Owner",
+      email: other.user.email,
+      role: "owner",
+      portal_access_enabled: true,
+      active: true,
+      hourly_rate_cents: 1500,
+      rate_effective_date: "2026-08-15",
+    });
+    const first = service.sendDirectMessage(alpha.user, { recipient_user_id: beta.user.id, body: "Can you check the proof?" });
+    expect(first.direction).toBe("sent");
+    expect(() => service.sendDirectMessage(alpha.user, { sender_user_id: beta.user.id, recipient_user_id: beta.user.id, body: "spoof" })).toThrow("message_sender_spoof");
+    expect(() => service.sendDirectMessage(alpha.user, { recipient_user_id: alpha.user.id, body: "self" })).toThrow("message_recipient_invalid");
+    expect(() => service.sendDirectMessage(alpha.user, { recipient_user_id: other.user.id, body: "cross tenant" })).toThrow("message_recipient_invalid");
+
+    expect(service.listMessageConversations(beta.user).items[0].unread_count).toBe(1);
+    const betaThread = service.messageConversation(beta.user, alpha.user.id);
+    expect(betaThread.messages[0].unread).toBe(false);
+    expect(db.prepare("SELECT recipient_read_at FROM employee_direct_messages WHERE id = ?").get(first.id).recipient_read_at).toBeTruthy();
+
+    const second = service.sendDirectMessage(alpha.user, { recipient_user_id: beta.user.id, body: "Second note" });
+    service.messageConversation(alpha.user, beta.user.id);
+    expect(db.prepare("SELECT recipient_read_at FROM employee_direct_messages WHERE id = ?").get(second.id).recipient_read_at).toBeNull();
+
+    service.updateEmployee(owner, beta.employee.id, { active: false });
+    const historicalThread = service.messageConversation(alpha.user, beta.user.id);
+    expect(historicalThread.participant.user_id).toBe(beta.user.id);
+    expect(historicalThread.messages.map((message) => message.body)).toEqual(["Can you check the proof?", "Second note"]);
+    expect(() => service.sendDirectMessage(alpha.user, { recipient_user_id: beta.user.id, body: "inactive" })).toThrow("message_recipient_invalid");
+    expect(() => service.messageConversation(other.user, beta.user.id)).toThrow("message_not_found");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action = 'message.send' AND actor_user_id = ?").get(alpha.user.id).count).toBe(2);
+  });
+
+  it("exports and restores announcement and message records with employee/user remapping", async () => {
+    const alpha = await employeeFixture({ display: "Backup Alpha" });
+    const beta = await employeeFixture({ display: "Backup Beta" });
+    const announcement = service.createAnnouncement(owner, { title: "Backup Notice", body: "Restore this.", publish_at: "2020-01-01T08:00" });
+    service.portalAnnouncement(alpha.user, announcement.id);
+    service.sendDirectMessage(alpha.user, { recipient_user_id: beta.user.id, body: "Restore this message." });
+
+    const backup = service.createBackup(owner, { passphrase: "long-passphrase-7", passphrase_confirmation: "long-passphrase-7" });
+    const payload = decryptBackup(backup.buffer, "long-passphrase-7");
+    expect(payload.data.employee_announcements).toHaveLength(1);
+    expect(payload.data.employee_announcement_reads).toHaveLength(1);
+    expect(payload.data.employee_direct_messages).toHaveLength(1);
+
+    const targetSession = await bootstrap("target-message-restore");
+    const targetActor = targetSession.user;
+    const targetAlpha = await service.addUser(targetActor, { display_name: alpha.user.display_name, email: alpha.user.email, password: "password123", role: alpha.user.role });
+    const targetBeta = await service.addUser(targetActor, { display_name: beta.user.display_name, email: beta.user.email, password: "password123", role: beta.user.role });
+    const preview = service.previewBackup(targetActor, backupFile(backup), { passphrase: "long-passphrase-7" });
+    expect(preview.restore_permitted).toBe(true);
+    expect(preview.counts.employee_announcements).toBe(1);
+    expect(preview.counts.employee_announcement_reads).toBe(1);
+    expect(preview.counts.employee_direct_messages).toBe(1);
+    service.restoreBackup(targetActor, backupFile(backup), {
+      passphrase: "long-passphrase-7",
+      confirmation_phrase: service.tenant(targetActor.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+    const restoredMessage = db.prepare("SELECT * FROM employee_direct_messages WHERE tenant_id = ?").get(targetActor.tenant_id);
+    const restoredRead = db.prepare("SELECT * FROM employee_announcement_reads WHERE tenant_id = ?").get(targetActor.tenant_id);
+    expect(restoredMessage.sender_user_id).toBe(targetAlpha.id);
+    expect(restoredMessage.recipient_user_id).toBe(targetBeta.id);
+    expect(restoredRead.user_id).toBe(targetAlpha.id);
+
+    const malformed = refreshManifest(payload);
+    malformed.data.employee_direct_messages[0].tenant_id = "wrong-tenant";
+    refreshManifest(malformed);
+    expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(malformed, "long-passphrase-7")), { passphrase: "long-passphrase-7" })).toThrow("backup_relationship_invalid");
+
+    const messageWithoutEmployee = refreshManifest(JSON.parse(JSON.stringify(payload)));
+    messageWithoutEmployee.data.employee_direct_messages[0].recipient_user_id = owner.id;
+    refreshManifest(messageWithoutEmployee);
+    expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(messageWithoutEmployee, "long-passphrase-7")), { passphrase: "long-passphrase-7" })).toThrow("backup_relationship_invalid");
+
+    const duplicateRead = refreshManifest(JSON.parse(JSON.stringify(payload)));
+    duplicateRead.data.employee_announcement_reads.push({ ...duplicateRead.data.employee_announcement_reads[0], id: "duplicate-read-row" });
+    refreshManifest(duplicateRead);
+    expect(() => service.previewBackup(targetActor, backupFile(encryptedPayload(duplicateRead, "long-passphrase-7")), { passphrase: "long-passphrase-7" })).toThrow("backup_relationship_invalid");
+  });
+});
+
+describe("migration contract", () => {
+  it("normalizes legacy production snapshots during migration 014 and fails Work Order conflicts", async () => {
+    const legacyDb = openDatabase(":memory:");
+    try {
+      runMigrationsThrough(legacyDb, "013_v2_stage7_8_messages_announcements.sql");
+      const legacyService = new SlimService(legacyDb);
+      const legacySession = await legacyService.registerTenant({
+        tenant_name: "legacy-group-c",
+        tenant_slug: "legacy-group-c",
+        owner_name: "Owner",
+        owner_email: "legacy-group-c@example.com",
+        owner_password: "password123",
+        sales_tax_rate_basis_points: 825,
+      });
+      const actor = legacySession.user;
+      const c = legacyService.createCustomer(actor, { contact_name: "Legacy Customer", billing_address: address });
+      const unreleased = legacyService.createOrder(actor, { title: "Unreleased Legacy", customer_id: c.id, items: [item({ title: "Unreleased" })] });
+      legacyDb.prepare("UPDATE order_items SET production_stage = 'complete', completed = 1 WHERE id = ?").run(unreleased.items[0].id);
+      const released = legacyService.createOrder(actor, { title: "Released Legacy", customer_id: c.id, items: [item({ title: "Released" })] });
+      const activeWorkOrder = legacyService.sendOrderToProduction(actor, released.id, { mode: "whole_order" }).work_orders[0];
+      legacyService.setWorkOrderStage(actor, activeWorkOrder.id, "in_progress");
+      legacyDb.prepare("UPDATE order_items SET production_stage = 'complete', completed = 1 WHERE id = ?").run(released.items[0].id);
+      const cancelled = legacyService.createOrder(actor, { title: "Cancelled Legacy", customer_id: c.id, items: [item({ title: "Cancelled" })] });
+      const cancelledWorkOrder = legacyService.sendOrderToProduction(actor, cancelled.id, { mode: "whole_order" }).work_orders[0];
+      legacyDb.prepare("UPDATE work_orders SET status = 'cancelled' WHERE id = ?").run(cancelledWorkOrder.id);
+
+      runMigrations(legacyDb);
+
+      expect(legacyDb.prepare("SELECT production_stage, completed FROM order_items WHERE id = ?").get(unreleased.items[0].id)).toMatchObject({ production_stage: "not_started", completed: 0 });
+      expect(legacyDb.prepare("SELECT production_stage, completed FROM order_items WHERE id = ?").get(released.items[0].id)).toMatchObject({ production_stage: "in_progress", completed: 0 });
+      expect(legacyDb.prepare("SELECT production_stage, completed FROM order_items WHERE id = ?").get(cancelled.items[0].id)).toMatchObject({ production_stage: "not_started", completed: 0 });
+      expect(legacyDb.prepare("SELECT active FROM work_order_items WHERE work_order_id = ?").get(cancelledWorkOrder.id).active).toBe(0);
+    } finally {
+      legacyDb.close();
+    }
+
+    const conflictDb = openDatabase(":memory:");
+    try {
+      runMigrationsThrough(conflictDb, "013_v2_stage7_8_messages_announcements.sql");
+      const conflictService = new SlimService(conflictDb);
+      const conflictSession = await conflictService.registerTenant({
+        tenant_name: "legacy-group-c-conflict",
+        tenant_slug: "legacy-group-c-conflict",
+        owner_name: "Owner",
+        owner_email: "legacy-group-c-conflict@example.com",
+        owner_password: "password123",
+        sales_tax_rate_basis_points: 825,
+      });
+      const actor = conflictSession.user;
+      const c = conflictService.createCustomer(actor, { contact_name: "Conflict Customer", billing_address: address });
+      const order = conflictService.createOrder(actor, { title: "Conflict Legacy", customer_id: c.id, items: [item({ title: "Conflict" })] });
+      const workOrder = conflictService.sendOrderToProduction(actor, order.id, { mode: "whole_order" }).work_orders[0];
+      conflictDb.prepare("UPDATE work_orders SET production_stage = 'complete', completed = 0 WHERE id = ?").run(workOrder.id);
+      expect(() => runMigrations(conflictDb)).toThrow(/CHECK|constraint/i);
+    } finally {
+      conflictDb.close();
+    }
+  });
+
+  it("records additive migration history", () => {
+    const migrations = db.prepare("SELECT id FROM schema_migrations").all().map((row) => row.id);
+    expect(migrations).toEqual(["001_v1_part2_core.sql", "002_v1_part3_order_workspace_production.sql", "003_v1_part4_dashboard_calendar_reminders.sql", "004_v1_part5_backup_restore.sql", "005_stage1_full_calendar.sql", "006_stage2_shared_scheduling.sql", "007_stage2_calendar_hardening.sql", "008_stage3_work_orders_bundles.sql", "009_stage3_hardening.sql", "010_v2_stage1_2_communications_intake.sql", "011_v2_stage3_4_camera_annotation.sql", "012_v2_stage5_6_time_pay.sql", "013_v2_stage7_8_messages_announcements.sql", "014_hardening_production_source_of_truth.sql", "015_commercial_release_b_account_abuse_controls.sql", "016_step3_expenses_sales_tax.sql", "017_home_dashboard_preferences.sql", "018_demo_data_markers.sql"]);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'order_attachments'").get().name).toBe("order_attachments");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'calendar_events'").get().name).toBe("calendar_events");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'backup_restore_receipts'").get().name).toBe("backup_restore_receipts");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'outbound_email_sends'").get().name).toBe("outbound_email_sends");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'order_intake_items'").get().name).toBe("order_intake_items");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_order_attachment_derivative_insert'").get().name).toBe("trg_order_attachment_derivative_insert");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'employee_time_entries'").get().name).toBe("employee_time_entries");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_employee_user_tenant_insert'").get().name).toBe("trg_employee_user_tenant_insert");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'employee_announcements'").get().name).toBe("employee_announcements");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'employee_direct_messages'").get().name).toBe("employee_direct_messages");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_employee_direct_message_insert'").get().name).toBe("trg_employee_direct_message_insert");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'ux_schedule_views_shared_name'").get().name).toBe("ux_schedule_views_shared_name");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_work_order_items_membership_insert'").get().name).toBe("trg_work_order_items_membership_insert");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_order_items_production_snapshot_update'").get().name).toBe("trg_order_items_production_snapshot_update");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rate_limit_buckets'").get().name).toBe("rate_limit_buckets");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'signup_invitations'").get().name).toBe("signup_invitations");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'password_reset_tokens'").get().name).toBe("password_reset_tokens");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_users_email_active'").get().name).toBe("idx_users_email_active");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_signup_invitations_tenant_created'").get().name).toBe("idx_signup_invitations_tenant_created");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'expenses'").get().name).toBe("expenses");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'expense_attachments'").get().name).toBe("expense_attachments");
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_expense_attachments_one_active'").get().name).toBe("idx_expense_attachments_one_active");
+    expect(db.prepare("PRAGMA table_info(tenants)").all().map((row) => row.name)).toContain("storage_quota_bytes");
+    expect(db.prepare("PRAGMA table_info(tenant_email_settings)").all().map((row) => row.name)).toContain("sender_verified_email");
+  });
+
+  it("does not promote legacy tenant-controlled SendGrid verification into recovery trust", async () => {
+    const legacyDb = openDatabase(":memory:");
+    try {
+      runMigrationsThrough(legacyDb, "014_hardening_production_source_of_truth.sql");
+      const legacyService = new SlimService(legacyDb);
+      const session = await legacyService.registerTenant({
+        tenant_name: "Legacy Sender",
+        tenant_slug: "legacy-sender",
+        owner_name: "Owner",
+        owner_email: "legacy-sender@example.com",
+        owner_password: "password123",
+      });
+      legacyDb
+        .prepare(
+          `INSERT INTO tenant_email_settings
+           (tenant_id, sender_name, sender_email, sendgrid_verified, created_at, updated_at)
+           VALUES (?, ?, ?, 1, ?, ?)`,
+        )
+        .run(session.user.tenant_id, "Legacy Sender", "legacy-sender@example.com", new Date().toISOString(), new Date().toISOString());
+
+      runMigrations(legacyDb);
+
+      const settings = legacyDb.prepare("SELECT sendgrid_verified, sender_verified_email FROM tenant_email_settings WHERE tenant_id = ?").get(session.user.tenant_id);
+      expect(settings).toMatchObject({ sendgrid_verified: 0, sender_verified_email: null });
+    } finally {
+      legacyDb.close();
+    }
+  });
+
+  it("restores historical calendar links to cancelled Work Orders without active item links", async () => {
+    const c = customer(owner);
+    const order = service.createOrder(owner, { title: "Historical Calendar", customer_id: c.id, items: [item({ title: "Panel A" }), item({ title: "Panel B" })] });
+    const oldWorkOrder = service.sendOrderToProduction(owner, order.id, { mode: "whole_order" }).work_orders[0];
+    service.createCalendarEvent(owner, { title: "Past production block", order_id: order.id, order_item_id: order.items[0].id, work_order_id: oldWorkOrder.id, start_at: "2020-01-01T09:00", end_at: "2020-01-01T10:00", assigned_user_id: owner.id });
+    service.setWorkOrderStage(owner, oldWorkOrder.id, "in_progress");
+    service.regroupOrderProduction(owner, order.id, { mode: "individual_items", reason: "Split work after historical schedule" });
+    const backup = service.createBackup(owner, { passphrase: "long-passphrase-cancelled-work-order", passphrase_confirmation: "long-passphrase-cancelled-work-order" });
+    const targetSession = await bootstrap("target-cancelled-work-order-calendar");
+    const targetActor = targetSession.user;
+    service.restoreBackup(targetActor, backupFile(backup), {
+      passphrase: "long-passphrase-cancelled-work-order",
+      confirmation_phrase: service.tenant(targetActor.tenant_id).company_name,
+      unmatched_assignment_policy: "restore_unassigned",
+    });
+
+    const restoredEvent = db.prepare("SELECT ce.*, wo.status AS work_order_status FROM calendar_events ce JOIN work_orders wo ON wo.id = ce.work_order_id AND wo.tenant_id = ce.tenant_id WHERE ce.tenant_id = ? AND ce.title = 'Past production block'").get(targetActor.tenant_id);
+    expect(restoredEvent.work_order_id).toBeTruthy();
+    expect(restoredEvent.work_order_status).toBe("cancelled");
+    expect(restoredEvent.order_item_id).toBe(null);
+  });
+});

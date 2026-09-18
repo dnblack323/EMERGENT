@@ -1,0 +1,1099 @@
+# SignGuy Slim Commercial Release Readiness Audit
+
+Audit date: 2026-09-02
+
+Audited repository: `dnblack323/SIGNGUY-SLIM`
+
+Audited main SHA: `ef0958039c098e3b9cc662030f1c48ef5c26844f`
+
+Scope: audit only. Hardening Groups A-F are treated as complete and merged. Version 2 Stage 9 Facebook/Meta work remains deferred and was not implemented, scaffolded, or planned as part of this audit.
+
+## Overall Classification
+
+**NOT READY** for paying outside sign shops in a hosted commercial setting.
+
+The current app is in strong shape for controlled pilot use by an operator who can manually manage persistence, backups, accounts, and abuse controls. It should not accept paying customers until the BLOCKER items below are fixed and the HIGH items either fixed or explicitly accepted with documented operational mitigations.
+
+## Finding Counts
+
+| Severity | Count |
+| --- | ---: |
+| BLOCKER | 2 |
+| HIGH | 6 |
+| MEDIUM | 8 |
+| LOW | 4 |
+| ACCEPTED / DEFERRED | 5 |
+
+## Validation Evidence
+
+| Check | Result |
+| --- | --- |
+| Baseline verification | Local `main` and `origin/main` both resolved to `ef0958039c098e3b9cc662030f1c48ef5c26844f` before audit changes. |
+| Tracked working tree before audit doc | Clean. |
+| `npm run test` | Passed: 203 tests across 4 files. |
+| `npm run lint` | Passed: 0 errors, 14 warnings. |
+| `npm run guard` | Passed: no excluded later-stage or full-MVP imports or dependencies found. |
+| `npm run build` | Passed: Vite production build completed. |
+| `SIGNGUY_SLIM_DB_PATH=:memory: npm run backend:migrate` | Passed: migrations applied to in-memory database. |
+| `git diff --check` | Passed. |
+| Audit-document trailing whitespace scan | Passed. |
+| `npm audit --json` | Passed: 0 vulnerabilities. |
+| `npm audit --omit=dev --json` | Passed: 0 production vulnerabilities. |
+| `npm ci` | Failed non-destructively with Windows `EPERM` unlinking the Rolldown native binding under `node_modules/@rolldown/.binding-win32-x64-msvc-*`. No clean/reset/delete workaround was run. |
+
+## Release A Remediation Update
+
+Release A addresses the data-durability release gate without changing the
+original audit baseline or declaring the product commercially ready.
+
+Implemented Release A remediation:
+
+- `CRR-001`: adds operator-run SQLite server backup, restore, metadata,
+  checksum/quick-check validation, WAL/SHM sidecar-safe restore, retention, and
+  pre-migration backup command support. Retention counts only fully verified
+  backup sets, ignores partial/malformed/corrupt directories rather than
+  silently deleting questionable data, and preserves the backup set created by
+  the current operation. Backup sets are written with private permissions where
+  supported by the host platform. Production backend
+  startup refuses missing or pending-migration databases so schema changes go
+  through the pre-migration backup workflow. Commercial readiness still requires
+  the operator to copy completed backup sets off-host and perform a recovery
+  drill.
+- `CRR-002`: adds operator-run private attachment backup and restore with
+  symlink/path traversal checks, Windows-aware manifest path validation,
+  checksum manifest validation, metadata hash verification, separated combined
+  restore targets, backup-root overlap rejection, symlinked archived ancestor
+  rejection, and full-backup database-to-attachment coherence checks for both
+  order and accepted intake attachment rows. Commercial readiness still
+  requires durable attachment storage and off-host backup replication.
+- `CRR-007`: adds production fail-fast validation for database, attachment, and
+  server-backup storage paths. Remaining production configuration work for
+  later releases includes abuse controls, account recovery policy, support
+  operations, and deployment monitoring.
+- `CRR-009`: adds SQLite WAL, busy timeout, and production topology
+  documentation for the supported single-backend hosted deployment.
+- `CRR-018`: adds server backup/recovery and production deployment runbooks
+  describing retention, restore, migration, off-host copy, and recovery-drill
+  expectations.
+
+Release A does not address `CRR-003`, `CRR-004`, `CRR-005`, `CRR-006`,
+`CRR-008`, or the later Release C-E findings.
+
+Server backup sets remain privileged infrastructure artifacts. They can contain
+all tenants' business data plus runtime database security data such as password
+hashes and session hashes, so they must be protected and retained under the
+operator's infrastructure backup policy rather than shared as customer-portable
+exports.
+
+## Release B Remediation Update
+
+Release B addresses the account-abuse and controlled-onboarding findings without
+changing the original audit baseline or declaring the product commercially
+ready.
+
+Implemented Release B remediation:
+
+- `CRR-003`: adds SQLite-backed fixed-window rate limits with hashed bucket keys
+  for login, registration, password reset request/completion, authenticated
+  customer-email sends, uploads, and backup export/preview/restore operations.
+- `CRR-004`: adds generic public reset requests, single-use hashed reset tokens,
+  token expiration, inactive-user rejection, session revocation after reset,
+  and same-tenant owner/admin reset-link generation for operator-assisted
+  recovery.
+- `CRR-005`: makes production registration invite-only by default unless
+  explicitly enabled, adds single-use hashed signup invitations, supports
+  invite-token registration links, and keeps development registration friendly.
+- `CRR-008`: adds tenant storage quotas, tenant quota visibility, host-managed
+  quota policy, quota checks for upload/annotation/intake/copy/portable-restore
+  paths, and portable-backup exclusion for hosted quota/runtime control data.
+
+Release B does not address `CRR-006` or the later Release C-E findings. The
+overall commercial launch classification remains **NOT READY** until remaining
+high-priority authorization, operations, monitoring, support, legal, and
+quote/invoice remediation work is complete or explicitly accepted by the
+operator.
+
+## Release C Remediation Update
+
+Release C addresses the commercial authorization scope finding without changing
+the original audit baseline or declaring the product commercially ready.
+
+Implemented Release C remediation:
+
+- `CRR-006`: makes owner/admin/manager the commercial write roles for
+  Customers, Quotes, Orders, Incoming Requests, customer communications,
+  customer email, invoices, payments, backup/settings, and commercial Calendar
+  mutations, and blocks direct staff access to commercial list/detail routes
+  that expose customer, Quote, intake, invoice, or all-Order records.
+- Keeps staff users focused on assigned production execution, production
+  evidence attachments/photo/annotation for their assigned work, financially
+  stripped assigned Order/Work Order operational detail, constrained personal
+  Calendar entries, Employee Portal operations, Time Clock, My Pay,
+  announcements, and one-to-one internal messages.
+- Adds explicit session capabilities so frontend navigation and direct-route
+  behavior align with backend policy while backend checks remain authoritative.
+- Keeps production staff financial stripping intact and prevents the generic
+  `staff` role from becoming another commercial mutation authority.
+
+Release C does not address Release D/E operational, monitoring, support,
+legal, final launch smoke-test, or quote/invoice document-polish findings. The
+overall commercial launch classification remains **NOT READY** until those
+remaining releases are complete or explicitly accepted by the operator.
+
+## Release D Remediation Update
+
+Release D addresses operations, diagnostics, support runbooks, release gates,
+and launch checklists without changing normal shop workflows or declaring the
+product commercially ready.
+
+Implemented Release D remediation:
+
+- `CRR-010`: keeps existing SendGrid delivery-state history as the source of
+  truth, adds operator diagnostics for failed/rejected/stale email sends, and
+  documents a controlled manual resend workflow that preserves failed provider
+  evidence instead of adding an automatic retry queue.
+- `CRR-011`: adds `GET /api/health`, `GET /api/ready`, response
+  `X-Request-Id`, bounded caller request-ID acceptance, structured JSON-line
+  request/error logs, safe client error correlation IDs, and server-side
+  unexpected-error stack logging.
+- `CRR-012`: adds deterministic operations smoke and dependency-audit gates to
+  GitHub Slim CI while preserving the existing clean install, migration, test,
+  lint, guard, and build gates.
+- `CRR-014`: adds `docs/COMMERCIAL_LAUNCH_BUSINESS_CHECKLIST.md` to separate
+  code-complete launch inputs from owner/legal/operator requirements for
+  privacy, terms, retention, support, email, payroll, sales-tax, and incident
+  obligations.
+- `CRR-015`: adds `docs/SUPPORT_AND_INCIDENT_RESPONSE.md` and a safe
+  `npm run backend:diagnostics` command for account, email, quota, backup, and
+  restore support triage without collecting secrets or customer files.
+- `CRR-016`: adds `docs/COMMERCIAL_RELEASE_CHECKLIST.md` with a practical role,
+  workflow, error, empty-state, browser/device, and post-deploy smoke matrix.
+- `CRR-017`: refreshes current status language for Releases A-C complete,
+  Release D operations readiness, Release E outstanding, and Stage 9 deferred.
+- `CRR-020`: documents realistic browser/device support expectations and keeps
+  real-device camera/photo smoke testing as a deployment validation item rather
+  than a repository merge blocker.
+
+Remaining Release D operator conditions:
+
+- external uptime checks, alerting, log retention, disk/volume metrics, TLS
+  monitoring, SendGrid account monitoring, off-host backup replication, and
+  restore-drill records must be run by the host/operator;
+- legal/business items still require owner/legal review;
+- browser/device support is limited to the environments actually smoke tested
+  before launch.
+
+The overall commercial launch classification remains **NOT READY** until
+Release E document polish and a final commercial re-audit are complete or the
+remaining limitations are explicitly accepted by the operator.
+
+## Top Commercial Risks
+
+1. **CRR-013**: Quote/invoice document polish remains before broad commercial launch.
+2. **CRR-014**: Release/legal/privacy obligations require owner/legal review before public paid signup.
+3. **Final re-audit**: A final commercial readiness re-audit remains required after Release E and owner/operator acceptance of remaining business conditions.
+4. **CRR-010**: Email/intake delivery depends on configured SendGrid sender/domain, provider monitoring, and manual review of failed/stale delivery states.
+5. **CRR-011**: Slim now exposes health/readiness and request correlation, but the host/operator must still provide external monitoring and log retention.
+6. **CRR-015**: Support runbooks and diagnostics exist, but operational support ownership and escalation coverage remain a business requirement.
+7. **CRR-016**: Manual release smoke testing is documented and must be executed on target devices before launch.
+8. **CRR-020**: Browser/device coverage is documented, but target-device smoke remains a deployment gate.
+9. **CRR-A01**: Stage 9 Facebook/Meta order intake remains deferred.
+10. **CRR-A02**: Payroll remains internal tracking only and must not be represented as tax/payroll filing.
+
+## Findings
+
+### CRR-001
+
+Severity: **BLOCKER**
+
+Category: Hosted data durability and recovery
+
+Affected file/component: `backend/src/db.js`, `.env.example`, `README.md`, deployment/operator documentation.
+
+Evidence: `backend/src/db.js` defaults to `data/signguy-slim.sqlite` and opens a local SQLite file. The repository has portable tenant backup support, but no automated server-side database backup, retention schedule, off-machine copy, point-in-time restore procedure, or production restore drill. `.env.example` only lists the local database path and does not define a hosted backup contract.
+
+Commercial risk: A disk loss, bad deployment, failed host, accidental overwrite, or operator mistake can permanently destroy all tenant business records. Portable exports are valuable, but they depend on someone manually creating and safely storing them before the incident.
+
+Recommended correction: Add an initial production operations runbook and automation for SQLite database backups: scheduled consistent snapshots, off-host/off-volume retention, restore drill, pre-migration backup, and rollback expectations. If the initial topology uses a persistent volume, document and verify that volume separately from application code.
+
+Code change required: **Yes**, if the app should provide a backup command, health/reporting metadata, or pre-migration backup helper. Otherwise a documented deployment automation/runbook can satisfy the first release gate.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Temporarily yes**, only if the operator owns and tests a concrete off-host backup and restore process before onboarding paying customers.
+
+Release A status: **Mitigated in code and documentation, with an operator
+condition**. The repository now includes server backup/restore commands,
+pre-migration backup support, backup metadata, SQLite quick-check validation,
+WAL/SHM-aware restore, retention that preserves questionable backup directories
+for inspection, and production startup refusal when migrations have not been
+pre-applied. Runtime storage validation also rejects directory-backed roots that
+contain the repository and rechecks separation after canonicalizing writable
+paths. This finding remains a commercial operations gate until off-host
+replication and a recovery drill are completed for the actual host.
+
+### CRR-002
+
+Severity: **BLOCKER**
+
+Category: Attachment/file durability
+
+Affected file/component: `backend/src/domains/shared.js`, `backend/src/domains/attachments/service.js`, `backend/src/backup.js`, `.env.example`, deployment documentation.
+
+Evidence: Attachment storage defaults to `data/attachments` through `SIGNGUY_SLIM_ATTACHMENT_ROOT`. Uploads and annotation derivatives are stored as filesystem bytes while metadata stays in SQLite. The code correctly protects filenames, paths, MIME/content, symlinks, checksums, and private authenticated preview/downloads, but the repository does not document a required persistent volume/object store, backup inclusion schedule, retention, or restore procedure for the hosted attachment root.
+
+Commercial risk: Customer artwork, proofs, photos, annotated derivatives, and intake attachments can disappear across redeploys or host replacement if the app is deployed on ephemeral disk. This is a direct customer-data-loss risk.
+
+Recommended correction: Define and enforce a production attachment durability contract: persistent mounted storage or object storage, off-host backups, restore relationship verification, storage monitoring, and operator recovery steps. Add a deployment checklist that makes ephemeral attachment storage an explicit no-go.
+
+Code change required: **Possibly**. Durable mounted storage can be operational, but adding startup checks/warnings and backup verification would reduce operator error.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Temporarily yes**, if production deployment uses persistent storage and an audited off-host backup process before launch.
+
+Release A status: **Mitigated in code and documentation, with an operator
+condition**. The repository now includes attachment backup/restore commands,
+checksum manifests, symlink/path traversal rejection, Windows-aware manifest
+path validation, metadata checksum verification, database-to-attachment
+coherence checks for order and accepted intake attachment rows in full backup
+sets, separated combined restore target validation, writable restored database
+publication, and restore verification. This finding remains a commercial
+operations gate until the actual deployment uses durable attachment storage and
+off-host backup replication.
+
+### CRR-003
+
+Severity: **HIGH**
+
+Category: Rate limiting and abuse protection
+
+Affected file/component: `backend/src/server.js`, public auth routes, webhook routes, upload routes, backup preview/restore/export.
+
+Evidence: Searches found no rate-limit, throttle, lockout, or attempt-control implementation. Public `POST /api/auth/login` and `POST /api/auth/register` exist. Authenticated but expensive routes include multipart uploads, backup preview/restore, email send, and broad mutation surfaces.
+
+Commercial risk: Password guessing, tenant-registration spam, disk exhaustion, backup CPU/memory pressure, and email-provider abuse are possible without application or edge limits.
+
+Recommended correction: Add simple bounded rate controls before release. At minimum protect login, registration, webhooks, uploads, backup preview/restore/export, and email sends. Prefer a small in-app limiter plus documented reverse-proxy limits for initial deployment.
+
+Code change required: **Yes**.
+
+Migration required: **No**, unless durable per-account throttling is implemented.
+
+Documentation/operations mitigation sufficient: **Only partially**. Edge limits help, but login and tenant-registration abuse should be enforced close to the app as well.
+
+Release B status: **Remediated for the bounded commercial-control target**.
+Application-level fixed-window limits now cover the public and expensive
+surfaces listed above, with hashed bucket keys and retry guidance. Edge/proxy
+rate limits are still recommended as an operational layer.
+
+### CRR-004
+
+Severity: **HIGH**
+
+Category: Account recovery and support readiness
+
+Affected file/component: auth/user management in `backend/src/services.js`, login UI in `src/App.jsx`, support documentation.
+
+Evidence: The code supports registration, login, adding users, activating/deactivating users, and session revocation. Searches found no password reset, forgot-password, recovery token, owner recovery, or operator recovery workflow.
+
+Commercial risk: A paying shop owner who forgets the only active owner password requires direct developer/database intervention. That is not a scalable or safe commercial support model.
+
+Recommended correction: Add a bounded password reset/recovery flow or a documented operator-admin recovery command with audit logging. Preserve the existing identity model; do not add SSO/MFA in this release unless separately authorized.
+
+Code change required: **Yes** for a self-service reset. A guarded operator command plus runbook may mitigate controlled pilot use.
+
+Migration required: **Possibly**, if reset tokens are stored.
+
+Documentation/operations mitigation sufficient: **No** for broad paying-customer launch; **partial** for a small controlled pilot.
+
+Release B status: **Remediated for the bounded commercial-control target**.
+Slim now supports generic reset requests, hashed one-time reset tokens,
+expiration, inactive-user rejection, successful-reset session revocation, and
+owner/admin operator reset links for same-tenant users.
+
+### CRR-005
+
+Severity: **HIGH**
+
+Category: Public registration control
+
+Affected file/component: `POST /api/auth/register` in `backend/src/server.js`, `SlimService.registerTenant` in `backend/src/services.js`, `src/App.jsx`.
+
+Evidence: Registration is public and creates a tenant, owner user, and active intake address. Input validation protects slug/email/password shape and tenant uniqueness, and Group F adds origin/fetch-metadata protections before cookie issuance. There is no invite code, allowlist, email verification, payment gate, admin approval, or rate limiting.
+
+Commercial risk: A publicly reachable hosted app can accumulate junk tenants, consume storage, increase support exposure, and create abuse paths before the shop has paid or been vetted.
+
+Recommended correction: For initial controlled commercial use, add an operator-controlled registration mode: invite codes, disabled self-registration by default, or an allowlisted signup workflow. Pair with rate limiting.
+
+Code change required: **Yes**, unless deployment places registration behind an external controlled front door.
+
+Migration required: **Possibly**, if invite records are persisted.
+
+Documentation/operations mitigation sufficient: **Partial** only for a non-public pilot URL.
+
+Release B status: **Remediated for controlled hosted onboarding**. Production
+registration is invite-only by default unless explicitly enabled, and signup
+invitations are high-entropy, hashed at rest, expiring, single-use, optionally
+email-bound, and audited.
+
+### CRR-006
+
+Severity: **HIGH**
+
+Category: Authorization scope
+
+Affected file/component: `backend/src/domains/shared.js`, `backend/src/server.js`, `backend/src/domains/customers/service.js`, `backend/src/domains/quotes/service.js`, `backend/src/domains/orders/service.js`, `backend/src/domains/communications/service.js`, `docs/SLIM_NAVIGATION_MAP.md`.
+
+Evidence: `WRITE_ROLES` includes `owner`, `admin`, `manager`, and `staff`. Customer, Quote, Order, Incoming Request, Production, Calendar, customer email, and manual communication routes generally use `WRITE_ROLES`. The navigation map confirms broad visibility for several commercial areas. Financial stripping exists for production/order summaries, and payment mutations are manager-gated, but the generic staff role remains broad.
+
+Commercial risk: A shop may expect staff to clock in, view assigned production, or use the Employee Portal without being able to edit commercial records or email customers. Current backend authorization permits more than many outside shops would consider commercially safe.
+
+Recommended correction: Define a commercial role/capability matrix and tighten backend permissions. A likely first pass is: owner/admin for settings/users/backup; owner/admin/manager for commercial document/payment/customer-email mutations; staff for assigned production/portal operations; pay capability for payroll. Keep frontend navigation aligned, but enforce backend first.
+
+Code change required: **Yes**.
+
+Migration required: **No**, unless adding granular persisted capabilities.
+
+Documentation/operations mitigation sufficient: **Partial**. Shops can assign trusted users only, but that limits practical employee use.
+
+Release C status: **Remediated for controlled commercial authorization**.
+Commercial write authority is now owner/admin/manager, staff production
+authority is limited to assigned operational Work Order execution and related
+production evidence, direct commercial read/list routes are blocked for staff,
+assigned operational order detail is financially stripped, and frontend
+navigation/direct-route handling aligns with the backend capability policy.
+
+### CRR-007
+
+Severity: **HIGH**
+
+Category: Production configuration and startup validation
+
+Affected file/component: `.env.example`, `backend/src/server.js`, `README.md`, `docs/GROUP_F_AUTH_TRANSPORT_AUDIT.md`, `docs/V2_STAGE1_2_REUSE_MAP.md`.
+
+Evidence: `.env.example` lists only `SIGNGUY_SLIM_DB_PATH`, `SIGNGUY_SLIM_ATTACHMENT_ROOT`, `SIGNGUY_SLIM_UPLOAD_LIMIT_BYTES`, and `PORT`. Runtime code also uses `NODE_ENV`, `SIGNGUY_SLIM_COOKIE_SECURE`, `SIGNGUY_SLIM_TRUST_PROXY`, `SIGNGUY_SLIM_ALLOWED_ORIGINS`, `SIGNGUY_SLIM_SENDGRID_API_KEY`, `SIGNGUY_SLIM_SENDGRID_WEBHOOK_SECRET`, `SIGNGUY_SLIM_INTAKE_WEBHOOK_SECRET`, `SIGNGUY_SLIM_INTAKE_DOMAIN`, and `SIGNGUY_SLIM_COMMIT_SHA`/`GITHUB_SHA`. The server starts with defaults and does not fail fast for unsafe production omissions.
+
+Commercial risk: A hosted deployment can silently start without secure-cookie intent, webhook secrets, origin allowlists, SendGrid config, durable paths, or release metadata. Misconfiguration becomes a runtime customer failure rather than a deployment failure.
+
+Recommended correction: Add a production configuration checklist and a small startup validation layer. Fail fast or loudly warn when `NODE_ENV=production` lacks HTTPS/secure-cookie posture, durable DB/attachment paths, required webhook secrets, allowed origins for split hosting, SendGrid configuration if customer email is enabled, and release SHA metadata.
+
+Code change required: **Yes** for fail-fast validation; documentation alone should not be the only guard.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Partial** for controlled internal deployments; not enough for repeatable commercial hosting.
+
+Release A status: **Partially remediated**. Production startup and migration
+entrypoints now fail fast for missing, relative, repository-local, overlapping,
+or unwritable database/attachment/server-backup storage paths. Later release
+work still owns broader production readiness items such as abuse controls,
+account recovery policy, support operations, and monitoring.
+
+### CRR-008
+
+Severity: **HIGH**
+
+Category: Upload/storage abuse
+
+Affected file/component: `backend/src/server.js`, `backend/src/domains/shared.js`, `backend/src/domains/attachments/service.js`, `backend/src/domains/communications/service.js`.
+
+Evidence: Individual upload and inbound attachment sizes are capped by `SIGNGUY_SLIM_UPLOAD_LIMIT_BYTES` with a 10 MB default. MIME, extension, and content validation are strong. No per-tenant storage quota, per-order count limit, daily upload budget, or disk-space guard was found.
+
+Commercial risk: A single tenant or compromised account can fill disk over time through repeated uploads, annotations, backup operations, or intake attachments. On a small hosted instance this can take the app down for all tenants.
+
+Recommended correction: Add storage limits: tenant-level quota, per-file limit, optional per-order attachment count, and operator-visible storage usage. Add monitoring/alerts for DB and attachment volume.
+
+Code change required: **Yes** for app-enforced quota.
+
+Migration required: **Possibly**, if quota settings or usage snapshots are stored.
+
+Documentation/operations mitigation sufficient: **Partial**, if reverse-proxy limits and disk monitoring are in place.
+
+Release B status: **Remediated for the bounded application quota target**.
+Tenant storage quotas are enforced before committing durable bytes for
+attachment upload, camera/annotation derivatives, incoming-request attachment
+persistence, intake-to-order copy, and portable restore. Quota policy remains
+hosted runtime data and is excluded from customer-portable backups.
+
+### CRR-009
+
+Severity: **MEDIUM**
+
+Category: SQLite production concurrency and durability tuning
+
+Affected file/component: `backend/src/db.js`, deployment documentation.
+
+Evidence: SQLite is opened through `node:sqlite` with `PRAGMA foreign_keys = ON`. No WAL mode, busy timeout, synchronous setting, single-process deployment note, or write-concurrency guidance was found in code.
+
+Commercial risk: For a small sign shop, SQLite can be acceptable. For a hosted multi-tenant deployment, lack of documented single-process constraints and lock-handling increases risk of transient write failures or operational confusion under concurrent use.
+
+Recommended correction: Document the supported initial topology as one backend process using a persistent local SQLite database. Consider enabling WAL and a busy timeout, and include a restore-from-backup drill.
+
+Code change required: **Recommended**, but not mandatory if initial usage is very small and operational constraints are explicit.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Yes**, for a controlled small-shop release.
+
+### CRR-010
+
+Severity: **MEDIUM**
+
+Category: Email deliverability and retry operations
+
+Affected file/component: `backend/src/domains/communications/service.js`, Settings email UI, SendGrid deployment docs.
+
+Evidence: SendGrid sends are idempotent by key, provider failures are recorded honestly as failed, delivery events are stored idempotently, and production webhook secrets are required when `NODE_ENV=production`. There is no retry queue, bounce-management workflow, verified-domain checklist in `.env.example`, or operator send-failure dashboard beyond communication history/status.
+
+Commercial risk: Email delivery failures may require manual operator intervention and may be missed by shop users unless they inspect history.
+
+Recommended correction: Add a production email checklist and a small operator workflow for failed/deferred/bounced sends. A retry queue can be deferred if manual resend is clearly documented.
+
+Code change required: **Not immediately**, unless automatic retry is required for launch.
+
+Migration required: **No** for documentation/manual workflow; **possibly** for queued retries.
+
+Documentation/operations mitigation sufficient: **Yes**, for initial controlled release.
+
+Release D status: **Mitigated for controlled release operations.** Existing
+delivery history remains authoritative; operator diagnostics now summarize
+failed/rejected/stale sends, and manual resend is documented as the bounded
+recovery path. SendGrid sender/domain monitoring remains an operator condition.
+
+### CRR-011
+
+Severity: **MEDIUM**
+
+Category: Operational monitoring and error diagnostics
+
+Affected file/component: `backend/src/server.js`, logging/deployment documentation.
+
+Evidence: API errors return stable JSON and avoid leaking stack traces. The catch block does not log unexpected server errors, attach request IDs, or expose an operator-visible error correlation path. No health/readiness endpoint was found.
+
+Commercial risk: When a customer reports a failure, the operator may not be able to distinguish validation errors, DB failures, provider failures, and unexpected exceptions quickly.
+
+Recommended correction: Add minimal structured request/error logging with redaction, request IDs, startup config summary, and a safe health/readiness endpoint that checks API and DB reachability without exposing sensitive details.
+
+Code change required: **Yes**.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Partial** only for very small pilot use.
+
+Release D status: **Remediated for initial operations visibility.** Slim now
+returns request IDs, logs structured request/error events, exposes safe
+liveness/readiness endpoints, and includes bounded operator diagnostics.
+External monitoring, log retention, and alerting remain host/operator
+responsibilities.
+
+### CRR-012
+
+Severity: **MEDIUM**
+
+Category: CI/release gate adequacy
+
+Affected file/component: `.github/workflows/ci.yml`, package scripts, release process documentation.
+
+Evidence: CI runs clean install, migrations, tests, lint, guard, and build on PRs and pushes to main. `npm audit` is not part of CI. There is no explicit production smoke, health smoke, or packaged deployment smoke in CI.
+
+Commercial risk: Dependency vulnerabilities and deployment-only failures can slip through a green PR CI.
+
+Recommended correction: Add a release workflow or CI job for `npm audit`, production-start smoke, health/readiness smoke after implementation, and at least one backup export/preview/restore smoke if not already covered by the regular test suite.
+
+Code change required: **Yes**, for CI/workflow additions.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Partial**, if the operator runs the checklist manually before each release.
+
+Release D status: **Mitigated.** CI now includes dependency-audit and
+operations-smoke gates in addition to clean install, migration, tests, lint,
+guard, and build. Production deployment smoke remains a release checklist item.
+
+### CRR-013
+
+Severity: **MEDIUM**
+
+Category: Customer-facing document polish
+
+Affected file/component: `backend/src/services.js`, `backend/src/pdf.js`, Quote/Invoice PDF generation.
+
+Evidence: PDF rendering is generated from plain text lines in `documentPdf`. Terminology is customer-facing and avoids internal "Estimate" filenames for quote PDFs, but output is intentionally minimal and not a branded commercial document template.
+
+Commercial risk: Quotes and invoices are functionally correct enough for pilot use, but may look unfinished or lack fields that outside shops expect on customer-facing paperwork.
+
+Recommended correction: Define the minimum commercial Quote/Invoice document template: logo, company legal/contact info, customer info, line items, taxable/tax totals, terms, status, and consistent filenames. Keep accounting complexity out of scope.
+
+Code change required: **Likely yes** for polished PDFs.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Yes**, if the first release positions PDFs as simple generated documents.
+
+### CRR-014
+
+Severity: **MEDIUM**
+
+Category: Legal/business launch operations
+
+Affected file/component: README/deployment documentation, public registration and hosted operations.
+
+Evidence: The repository documents product scope and payroll limitations, but no launch checklist was found for privacy policy, terms of service, data retention, deletion/export process, hosted backup responsibility, or customer support expectations.
+
+Commercial risk: Outside shops will store customer names, email addresses, addresses, artwork, invoices, time entries, and pay-tracking data. Commercial hosting needs business-facing terms and operational promises even when code security is sound.
+
+Recommended correction: Create a launch operations checklist covering privacy, terms, retention, export/delete process, support SLA, account recovery, backup responsibility, and incident response.
+
+Code change required: **No**, except links/settings if terms are surfaced in-product.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Yes**.
+
+Release D status: **Documented; human completion still required.** The launch
+business checklist separates code-complete items from owner/legal/operator
+requirements. Legal/privacy approval remains outside the repository.
+
+### CRR-015
+
+Severity: **MEDIUM**
+
+Category: Support and recovery tooling
+
+Affected file/component: Settings/users UI, backend user/session functions, operator documentation.
+
+Evidence: Owner/admin users can add/update users and deactivate users; deactivation revokes sessions. There is no operator support tool for safe owner recovery, tenant unlock, email troubleshooting, or tenant restore orchestration beyond the in-app backup/restore screen.
+
+Commercial risk: Early customers will need help with account lockouts, email misconfiguration, restore attempts, and user deactivation. Direct DB surgery is too risky as the normal support path.
+
+Recommended correction: Add a small documented operator support runbook and, where useful, CLI/admin-only commands for owner recovery and diagnostic summaries. Log all support mutations.
+
+Code change required: **Possibly**.
+
+Migration required: **No**, unless new support audit records are added.
+
+Documentation/operations mitigation sufficient: **Partial**.
+
+Release D status: **Mitigated.** `/api/health`, `/api/ready`, structured logs,
+and `npm run backend:diagnostics` expose safe package version and configured
+release SHA metadata without secrets or tenant data.
+
+Release D status: **Mitigated for initial support.** The support/incident
+runbook and non-mutating diagnostics command cover account, email, quota,
+backup, restore, and incident triage. Ongoing support staffing and escalation
+coverage remain business/operator commitments.
+
+### CRR-016
+
+Severity: **MEDIUM**
+
+Category: Empty/error state and release usability verification
+
+Affected file/component: major React feature modules under `src/features/`, browser release checklist.
+
+Evidence: The test suite covers many route and UI behaviors, but this audit did not find a maintained commercial smoke-test script or browser matrix for desktop, tablet, and mobile Employee Portal. Some pages use basic empty states and inline errors; release-critical deep-link/refresh and device-specific checks are not automated.
+
+Commercial risk: Shop users may hit confusing states on real devices even when backend correctness is strong.
+
+Recommended correction: Run and document a manual release smoke test on target devices before first commercial pilot. Add Playwright/browser smoke coverage later for login, order workspace, production, attachments, Employee Portal, backup, and logout.
+
+Code change required: **Not initially**, unless smoke testing exposes defects.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Yes** for controlled release.
+
+Release D status: **Documented.** The commercial release checklist defines the
+manual role, workflow, error, empty-state, browser/device, and post-deploy smoke
+matrix. It must still be executed on target devices before accepting customers.
+
+### CRR-017
+
+Severity: **LOW**
+
+Category: Documentation staleness
+
+Affected file/component: `README.md`, `docs/SLIM_HARDENING_REMEDIATION_PLAN.md`, `docs/SLIM_NAVIGATION_MAP.md`, `docs/SIGNGUY_SLIM_VERSION_2_MASTER_BUILD_PLAN.md`.
+
+Evidence: Some documents still use branch-era wording such as "current feature branch" for work now merged into `main`, and the remediation plan describes Group F as implemented on its branch rather than fully merged.
+
+Commercial risk: Low direct runtime risk, but stale status text can mislead future audits and release planning.
+
+Recommended correction: Refresh status language after this audit, keeping Stage 9 deferred.
+
+Code change required: **No product code**.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Yes**.
+
+Release D status: **Updated.** Current docs identify Releases A-C as complete,
+Release D as the operations-readiness pass, Release E as outstanding, and Stage
+9 as deferred.
+
+### CRR-018
+
+Severity: **LOW**
+
+Category: Release metadata discoverability
+
+Affected file/component: `package.json`, `backend/src/backup.js`, backend API.
+
+Evidence: `package.json` has version `0.2.0-v2-stage8`; backups include `SIGNGUY_SLIM_COMMIT_SHA` or `GITHUB_SHA` when configured. No authenticated release/version endpoint or startup-visible build identifier was found.
+
+Commercial risk: Support cannot easily confirm what code a customer deployment is running.
+
+Recommended correction: Add a safe authenticated version endpoint or include release SHA in startup logs/admin settings, backed by deployment configuration.
+
+Code change required: **Yes**, small.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Partial**.
+
+### CRR-019
+
+Severity: **LOW**
+
+Category: Email HTML sanitization future-proofing
+
+Affected file/component: `backend/src/domains/shared.js`, `backend/src/domains/communications/service.js`, Incoming Requests UI.
+
+Evidence: Inbound HTML is stored as both original and `sanitized_html`. Current frontend rendering found no `dangerouslySetInnerHTML`; React escaping and iframe sandboxing are preserved. The sanitizer is simple string filtering and should not be treated as sufficient for future raw HTML rendering.
+
+Commercial risk: No current release blocker because the sanitized HTML is not rendered raw. Risk rises if future UX displays incoming email HTML.
+
+Recommended correction: Keep rendering email as escaped text unless a robust sanitizer is introduced and tested.
+
+Code change required: **No**, unless raw HTML rendering is added later.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Yes**.
+
+### CRR-020
+
+Severity: **LOW**
+
+Category: Browser/device support statement
+
+Affected file/component: README/release docs, camera/annotation UX.
+
+Evidence: Camera capture, upload, downloads, cookie auth, and Employee Portal views rely on modern browser behavior. The repo documents physical-camera testing as environment dependent in prior stage docs, but no commercial browser/device support statement was found.
+
+Commercial risk: Low to medium support friction if a shop uses unsupported mobile browsers, blocked camera permissions, or non-secure contexts.
+
+Recommended correction: Document supported browsers and the secure-context requirement for camera testing. Keep real-device camera smoke as deployment validation, not a repository merge blocker.
+
+Code change required: **No**.
+
+Migration required: **No**.
+
+Documentation/operations mitigation sufficient: **Yes**.
+
+Release D status: **Documented.** The commercial release checklist states the
+initial supported browser/device assumptions and keeps real-device camera/photo
+smoke as a deployment validation item.
+
+## Accepted / Deferred Items
+
+### CRR-A01: Stage 9 Facebook/Meta Deferred
+
+Severity: **ACCEPTED / DEFERRED**
+
+Category: Product scope
+
+Evidence: Searches found no Facebook/Meta implementation, OAuth, webhook, dependency, navigation, or placeholder UI in the active source. Mentions are documentation-only deferrals.
+
+Release decision: Keep deferred. Do not start Stage 9 until Meta business app/Page setup, webhook routing, permissions, and app review requirements are available.
+
+### CRR-A02: Payroll Is Internal Pay Tracking
+
+Severity: **ACCEPTED / DEFERRED**
+
+Category: Product/accounting scope
+
+Evidence: README and Group D docs describe Time and Pay as internal tracking only, not tax withholding, payroll filing, direct deposit, or external payroll processing.
+
+Release decision: Accept for initial Slim scope, but product copy must remain explicit.
+
+### CRR-A03: SQLite Is Acceptable Under Initial Constraints
+
+Severity: **ACCEPTED / DEFERRED**
+
+Category: Database topology
+
+Evidence: Current implementation uses local SQLite with transactional migrations and tenant-scoped tables. This is reasonable for small single-process deployments if persistence and backup controls are fixed.
+
+Release decision: Accept for controlled small-shop release only with documented single-process constraints, backup/restore, and monitoring. Revisit if hosting many active shops or multiple API processes.
+
+### CRR-A04: No SSO/MFA/Social Login
+
+Severity: **ACCEPTED / DEFERRED**
+
+Category: Identity scope
+
+Evidence: Group F explicitly preserved the current identity model and hardened transport without adding new identity providers.
+
+Release decision: Accept for initial controlled release. Reassess MFA for broader commercial exposure.
+
+### CRR-A05: Portable Backup Excludes Runtime Sessions
+
+Severity: **ACCEPTED / DEFERRED**
+
+Category: Backup contract
+
+Evidence: Backup validation rejects password hashes and excludes sessions/auth cookies/CSRF/runtime secrets from portable tenant backup data.
+
+Release decision: Correct by design. Do not make live auth sessions portable business data.
+
+## Readiness by Area
+
+### Authentication and Session
+
+Status: **Ready after Group F and Release B, subject to remaining production operations and authorization-policy work.**
+
+Evidence reviewed:
+
+- Auth session tokens are generated with `crypto.randomBytes(32)`, hashed with SHA-256, stored in `sessions.token_hash`, and never returned in frontend JSON.
+- Browser authentication uses HttpOnly cookies: local HTTP uses `signguy_slim_session`; secure contexts use `__Host-signguy_slim_session`.
+- Cookie attributes include `HttpOnly`, `Path=/`, `SameSite=Lax`, expiry, max-age, and `Secure` when production/HTTPS/explicit secure mode applies.
+- `X-Forwarded-Proto` affects secure-cookie detection only when `SIGNGUY_SLIM_TRUST_PROXY=1`.
+- `/api/auth/me` authenticates through cookies and returns user, tenant, server-calculated capabilities, and `csrf_token`.
+- Unsafe authenticated methods require `X-CSRF-Token`; unauthenticated unsafe calls remain `401`; bad CSRF returns `403 csrf_invalid`.
+- Login/register/logout include Origin/Fetch Metadata protections.
+- Frontend API calls use `credentials: "include"` and no default app-auth `Authorization: Bearer` header.
+
+Release B adds application rate limits, controlled production registration, and
+password recovery without changing the Group F cookie/CSRF model. Release C
+removes broad staff commercial write authority. Remaining release risks are
+primarily Release D/E operational, support, launch-process, and document-polish
+work.
+
+### Authorization Matrix
+
+This matrix reflects the backend and frontend posture after Release C. Backend
+checks remain authoritative; frontend navigation and direct-route behavior are
+alignment only.
+
+| Area | Owner | Admin | Manager | Staff | Pay-enabled staff | Employee Portal |
+| --- | --- | --- | --- | --- | --- | --- |
+| Customers | view/write | view/write | view/write | blocked from direct commercial routes; context only through assigned operational payloads | same as staff | no direct portal route |
+| Quotes | view/write/send | view/write/send | view/write/send | blocked from direct commercial routes | same as staff | no direct portal route |
+| Orders | view/write/email/attachments | view/write/email/attachments | view/write/email/attachments | assigned operational detail only, financially stripped; assigned production evidence attachments only | same as staff | no direct portal route |
+| Incoming Requests | view/write/convert/link | view/write/convert/link | view/write/convert/link | blocked from direct commercial routes | same as staff | no direct portal route |
+| Production | manage/release/regroup/transition | manage/release/regroup/transition | manage/release/regroup/transition | assigned active Work Order execution only; no release/regroup | same as staff | no direct portal route |
+| Calendar | shared/commercial and personal | shared/commercial and personal | shared/commercial and personal | constrained own general/meeting/other entries; no commercial/resource/other-user scheduling | same as staff | no direct portal route |
+| Employees | manage | manage | list/review time only | no management | no extra employee admin | linked active employee only |
+| Time | review/manage | review/manage | review/manage | portal own clock only if eligible | portal own clock only if eligible | clock in/out, own time |
+| Payroll | manage | pay summary access via manager role is blocked unless pay capability? pay domain uses pay capability where implemented | requires pay capability for pay-management surfaces | blocked unless pay-enabled employee capability | can access pay-management where explicitly enabled | own pay only |
+| Announcements | manage | manage | read/list as applicable | read/list as applicable | same as staff | targeted read/unread |
+| Employee Messages | portal/direct participant behavior | portal/direct participant behavior | portal/direct participant behavior | portal/direct participant behavior | same as staff | one-to-one messages if eligible |
+| Invoices | view/create/status/send | view/create/status/send | view/create/status/send/payment | blocked from invoice/payment mutation | same as staff unless pay route | no direct portal route |
+| Payments | manage | manage | manage | blocked | blocked unless role also manager | no direct portal route |
+| Settings | manage | manage | no direct route | no direct route | no direct route | no direct portal route |
+| Backup/Restore | manage | manage | blocked | blocked | blocked | blocked |
+
+Release C correction: broad staff commercial access has been removed from the
+backend read/write policy and from visible navigation. Staff operational access
+is limited to assigned production execution, financially stripped assigned
+Order/Work Order context, constrained personal scheduling, and Employee Portal
+workflows.
+
+### Tenant Isolation
+
+Status: **Ready based on inspected code and current tests.**
+
+Evidence: Server obtains an actor from the authenticated session, and domain methods consistently scope primary reads/writes by `actor.tenant_id`. Secondary relationships such as customer/order/invoice/email links, Work Order item links, attachments, calendar assignees/resources, employees, payroll, announcements, messages, and restore validation are tenant-checked. Backup restore validates source tenant relationships and restores into an empty target tenant with ID remapping.
+
+No concrete cross-tenant access defect was found during this audit.
+
+### Registration and Tenant Creation
+
+Status: **Ready for controlled hosted onboarding after Release B.**
+
+Tenant isolation, owner creation, default role, duplicate slug/email handling,
+password hashing, default intake address creation, and session establishment are
+implemented. Production registration is invite-only by default unless explicitly
+enabled, invitation tokens are hashed and single-use, and registration attempts
+are rate-limited.
+
+### Password Security
+
+Status: **Ready for bounded hosted use after Release B.**
+
+Passwords are hashed with bcrypt cost 12 via `bcryptjs`, inputs require 8-128
+characters, login uses a generic invalid-shop/email/password response, and
+inactive users cannot authenticate. Release B adds login/reset rate limiting,
+generic public reset requests, hashed one-time reset tokens, expiration,
+inactive-user rejection, and session revocation after successful reset.
+
+### Secrets and Configuration
+
+Status: **No committed secrets found; production config checklist improved but still requires operator discipline.**
+
+Repository search found no hard-coded API keys, private keys, or real
+credentials outside test fixtures and docs. `.env` files and runtime data are
+ignored. Release A and B documented the durability, auth, onboarding, quota, and
+rate-limit environment variables. Final launch still needs Release D support and
+operations checklist completion.
+
+### Database and Migration Safety
+
+Status: **Application migrations are disciplined; production operations need hardening.**
+
+Migrations are ordered `001` through `015`; `runMigrations` tracks applied IDs
+and wraps each migration in `BEGIN IMMEDIATE`/`COMMIT` with rollback on failure.
+Group C migration `014` includes conflict detection and additive
+production-state triggers. Release B migration `015` is additive for quota,
+signup invitations, password reset tokens, and rate-limit buckets.
+
+### Backup and Recovery
+
+Status: **Portable backup is strong; hosted infrastructure recovery is improved after Release A.**
+
+Portable backup uses AES-256-GCM, PBKDF2-HMAC-SHA256, checksums, schema
+validation, empty-target restore, relationship validation, attachment byte
+validation, and secret exclusion. Release A adds server database/attachment
+backup and restore primitives. Operators still need off-host replication and
+restore drills before paid launch.
+
+### Attachments, Image, and Camera Privacy
+
+Status: **Security model is good; durability and quota controls are improved after Release A/B.**
+
+Attachment routes require authenticated tenant-scoped access; previews/downloads
+stream through the server with no-store/private cache headers, `nosniff`, safe
+filenames, path containment, symlink checks, checksums, and MIME/content
+validation. Original images and annotation derivatives are stored separately and
+privately. Release A adds durable file publication and server backup coverage;
+Release B adds tenant quota checks before durable attachment growth.
+
+### Production State Integrity
+
+Status: **Ready.**
+
+Group C remains intact: Work Orders are authoritative after release, Order Item production fields are compatibility snapshots, active Work Order membership is constrained, cancelled/historical Work Orders do not drive current status, reopen updates derived status, Calendar status remains independent, and order business status is not equated with production completion.
+
+### Financial Integrity
+
+Status: **Ready for simple manual invoices/payments; tax/accounting scope is limited.**
+
+Money is represented as integer cents. Quantities support up to 4 decimal
+places and line totals use BigInt rounding. Document totals validate
+discounts/tax basis points. Payment status rejects overpayment through
+`paymentStatus`. Invoices are manual records, not payment processing.
+Production staff financial stripping is present for production/order summaries.
+Release C removes broad staff commercial write access, so remaining financial
+limits are product/accounting scope rather than a known staff-authorization
+gap.
+
+### Tax Behavior
+
+Status: **Ready with limitation.**
+
+Slim supports a tenant sales-tax rate in basis points and customer tax-exempt snapshots. It does not implement jurisdictional tax calculation, filings, exemptions beyond stored flags/notes, or accounting integrations. This should be documented clearly for commercial users.
+
+### Communications and Incoming Requests
+
+Status: **Core safety ready; provider operations still require release checklist coverage.**
+
+SendGrid API key is server-only, customer email send is idempotent, provider
+failures are recorded as failures, webhook events are signed in production,
+intake webhook signatures are required in production, duplicate intake messages
+are detected, and attachments go through validation. Release B adds application
+rate limits for customer-email sends and controlled registration/reset abuse
+paths. Remaining gaps are operational: verified provider configuration, support
+playbooks, and monitoring.
+
+### XSS, SQL Injection, Path Traversal, Command Injection
+
+Status: **No release blocker found.**
+
+No active `dangerouslySetInnerHTML` usage was found. React escapes user strings. Attachment previews are either images or sandboxed iframes. Dynamic SQL inspected in domain modules uses controlled field names from zod-parsed objects or constant table/column inventories, with user values parameterized. Attachment paths are server-generated and guarded by path containment, symlink checks, safe filenames, and checksums. No `child_process` execution path was found.
+
+### Dependency Security
+
+Status: **Ready at audit time.**
+
+`npm audit --json` and `npm audit --omit=dev --json` reported 0 vulnerabilities.
+
+### CI Adequacy
+
+Status: **Strong development CI, missing release gates.**
+
+GitHub CI performs clean install, migration check, tests, lint, guard, and build on PRs and pushes to main. Add dependency audit and production smoke checks before commercial launch.
+
+### Deployment Topology
+
+Recommended initial topology:
+
+- Same-origin frontend and backend behind HTTPS.
+- One backend process per SQLite database.
+- Persistent disk/volume for `SIGNGUY_SLIM_DB_PATH`.
+- Persistent disk/volume or object-backed mount for `SIGNGUY_SLIM_ATTACHMENT_ROOT`.
+- Scheduled off-host backup for both DB and attachments.
+- Reverse proxy only if `SIGNGUY_SLIM_TRUST_PROXY=1` is configured deliberately for a known TLS-terminating proxy.
+- Explicit allowed origins if frontend/backend split origins are used.
+- SendGrid configured with a verified sender/domain before enabling customer email.
+
+Required production configuration checklist:
+
+- `NODE_ENV=production`
+- `PORT`
+- `SIGNGUY_SLIM_DB_PATH`
+- `SIGNGUY_SLIM_ATTACHMENT_ROOT`
+- `SIGNGUY_SLIM_SERVER_BACKUP_ROOT`
+- `SIGNGUY_SLIM_UPLOAD_LIMIT_BYTES`
+- `SIGNGUY_SLIM_COOKIE_SECURE=1` when secure detection is not otherwise reliable
+- `SIGNGUY_SLIM_TRUST_PROXY=1` only behind a trusted HTTPS-terminating proxy
+- `SIGNGUY_SLIM_ALLOWED_ORIGINS` for split-origin hosting
+- `SIGNGUY_SLIM_SENDGRID_API_KEY` if customer email is enabled
+- `SIGNGUY_SLIM_SENDGRID_WEBHOOK_SECRET` in production when SendGrid events are enabled
+- `SIGNGUY_SLIM_INTAKE_WEBHOOK_SECRET` in production when incoming email intake is enabled
+- `SIGNGUY_SLIM_INTAKE_DOMAIN`
+- `SIGNGUY_SLIM_COMMIT_SHA` or `GITHUB_SHA`
+- External backup destination/credentials managed outside the app
+
+## Manual Commercial Smoke Test
+
+Run this on the production-like deployment before accepting outside shops:
+
+1. Register or invite a tenant owner.
+2. Log in, refresh the browser, and confirm session restore.
+3. Create a customer.
+4. Create a Quote with taxable and non-taxable line items.
+5. Send/download the Quote PDF.
+6. Convert the Quote to an Order.
+7. Edit Order Workspace items and totals.
+8. Send required items to Production.
+9. Move a Work Order through ready, in progress, waiting, complete, and reopen.
+10. Create and complete/reopen a Calendar event without changing production state.
+11. Upload an image/file attachment.
+12. Create an annotated copy and verify the original is still separately accessible.
+13. Generate an Invoice.
+14. Record partial and full manual payments; verify overpayment is rejected.
+15. Create an Employee linked to a user.
+16. Use Employee Portal Time Clock.
+17. Review Time and close/reopen a pay week.
+18. Publish an Announcement and verify read/unread behavior.
+19. Send and read an Employee direct message.
+20. Send a customer email with provider configured; verify delivery/failure history.
+21. Receive an Incoming Request through the signed webhook path.
+22. Export an encrypted backup.
+23. Preview and restore into an empty tenant.
+24. Log out; verify old session cannot access APIs.
+25. Test a deep link/refresh for Orders, Order Workspace, Incoming Requests, Calendar, Employee Portal, and Settings/Backup.
+
+## Remediation Plan
+
+### Release A: Data Durability and Production Topology
+
+Status: complete.
+
+Priority: highest.
+
+Fixes: CRR-001, CRR-002, CRR-007, CRR-009, CRR-018.
+
+Files: `backend/src/config.js`, `backend/src/db.js`, `backend/src/migrate.js`,
+`backend/src/server.js`, `backend/src/serverBackup.js`,
+`backend/src/server-backup-cli.js`, `.env.example`, `README.md`,
+`docs/RELEASE_A_DATA_DURABILITY.md`,
+`docs/SERVER_BACKUP_AND_RECOVERY.md`,
+`docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md`, and focused tests.
+
+Migration need: none expected.
+
+Tests: startup config tests, health/version tests if added, migration/backup smoke.
+
+Release risk: low to medium. Most changes are operational/documentation, but startup validation can break misconfigured deployments by design.
+
+### Release B: Abuse Controls and Account Recovery
+
+Status: complete.
+
+Priority: high.
+
+Fixes: CRR-003, CRR-004, CRR-005, CRR-008.
+
+Likely files: `backend/src/server.js`, auth service code, user management UI, tests, possibly new support docs.
+
+Migration need: possible for password-reset tokens, invite codes, or quota settings.
+
+Tests: login/register rate-limit tests, reset/recovery tests, registration-control tests, quota tests, CSRF/session regression.
+
+Release risk: medium. Touches auth and public signup surfaces.
+
+### Release C: Commercial Authorization Policy
+
+Status: complete.
+
+Fixes: CRR-006 plus role-matrix/navigation alignment.
+
+Touched files: `backend/src/domains/shared.js`, domain service permission
+checks, `backend/src/domains/employees/capabilities.js`, `src/navigation.js`,
+commercial feature pages, tests, and documentation.
+
+Migration need: none.
+
+Tests: backend permission matrix coverage for major commercial, production,
+calendar, backup, reset, portal, and message paths; frontend nav/direct-route
+coverage for staff commercial restrictions and direct operational Order
+Workspace access.
+
+Release risk: low to medium. Staff commercial authority is narrowed while
+assigned production and Employee Portal workflows remain available.
+
+### Release D: Operations, Monitoring, and Support
+
+Status: implemented in `codex/release-d-commercial-operations`.
+
+Priority: medium.
+
+Fixes: CRR-010, CRR-011, CRR-012, CRR-014, CRR-015, CRR-016, CRR-017, CRR-020.
+
+Touched files: `.github/workflows/ci.yml`, `backend/src/server.js`,
+`backend/src/operations.js`, `backend/src/operations-smoke.js`,
+`backend/src/operations.test.js`, `package.json`, `README.md`, `AGENTS.md`,
+deployment/support/release checklist docs, and this audit.
+
+Migration need: unlikely.
+
+Tests: operations endpoint checks, readiness failure checks, request-ID checks,
+logging redaction checks, diagnostics checks, and CI operations-smoke gate.
+
+Release risk: low to medium.
+
+### Release E: Document Polish
+
+Priority: medium after durability/auth policy.
+
+Fixes: CRR-013.
+
+Likely files: `backend/src/pdf.js`, `backend/src/services.js` or document module, quote/invoice tests, README.
+
+Migration need: none.
+
+Tests: PDF content snapshot/semantic tests.
+
+Release risk: low.
+
+## Explicit Release Recommendation
+
+Do **not** accept paying outside sign shops yet.
+
+Proceed only with a controlled pilot if:
+
+- the deployment uses persistent storage for DB and attachments;
+- off-host backups and restore drills are already operating;
+- registration is not publicly exposed or is externally controlled;
+- staff commercial permissions are narrowed by Release C;
+- the operator accepts the remaining external monitoring, support staffing,
+  legal/privacy, final smoke-test, browser/device, and document-polish
+  limitations;
+- Release E document polish is complete or explicitly accepted as a controlled
+  pilot limitation;
+- a final commercial readiness re-audit has passed.
+
+Stage 9 should remain deferred until after the commercial readiness blockers and high-priority launch controls are resolved.

@@ -1,0 +1,303 @@
+# SignGuy Slim
+
+Independent slim sign-shop operations application with a tenant-scoped backend, focused shop workflows, and an intentionally smaller product boundary than `SIGNGUY-MVP`.
+
+This repository is intentionally separate from `SIGNGUY-MVP`. Slim owns its own application code, migrations, sessions, attachments, backup/restore behavior, CI, and product evolution. The full MVP repository may be used only as a read-only implementation reference unless a documented portability or reuse boundary explicitly permits otherwise.
+
+## Current Status
+
+`main` includes the completed Version 1 foundation, implemented Version 2 Stages 1-8, and Hardening Groups A-F:
+
+- Stage 1: SendGrid customer email and Customer communication history;
+- Stage 2: focused Email Order Intake, now surfaced as Incoming Requests inside Orders;
+- Stage 3: device-camera Order photo capture;
+- Stage 4: non-destructive photo annotation;
+- Stage 5: Employee administration, Time Clock, Time & Attendance, and Employee Portal Time Clock;
+- Stage 6: weekly pay tracking and My Pay;
+- Stage 7: Employee Announcements;
+- Stage 8: basic one-to-one Internal Employee Messages.
+
+Stages 7 and 8 are intentionally delivered together because they share the existing Employee Portal, authenticated employee/user identity, read/unread state, tenant/permission rules, audit patterns, and backup/restore requirements.
+
+The commercial release-readiness audit currently classifies the app as **NOT READY** for paying outside shops until the sequenced remediation plan is complete. Release A is complete for hosted data durability. Release B is complete for rate limiting, invitation-gated hosted registration, password recovery, and tenant storage quotas. Release C is complete for commercial authorization narrowing. Release D is complete for health/readiness, request correlation, safe structured logs, operator diagnostics, support runbooks, release gates, and smoke checklists. Step 3A adds bounded Expenses and Sales Tax tracking. Release E customer-document polish remains future remediation work.
+
+**Version 2 Stage 9, Facebook Page Order Intake, is deferred.** It should not be implemented or scaffolded until separately authorized after the required Meta business app/Page configuration, permissions, webhook setup, and any applicable app review are available.
+
+The authoritative Version 2 roadmap is:
+
+`docs/SIGNGUY_SLIM_VERSION_2_MASTER_BUILD_PLAN.md`
+
+The older `docs/V1_REMAINING_IMPLEMENTATION_PLAN.md` is historical Version 1 planning material and is not the current scope authority.
+
+## Current Product Areas
+
+Slim currently includes:
+
+- secure tenant-aware registration, authentication, roles, HttpOnly cookie sessions, CSRF-protected browser mutations, and audit history;
+- unauthenticated safe liveness/readiness endpoints, request IDs, structured operational logs, and an operator diagnostics command;
+- company settings and tenant-specific numbering;
+- Customers;
+- Quotes and Quote-to-Order conversion;
+- direct Orders and first-class Order Items;
+- full-screen Order Workspace;
+- Work Orders, production grouping, and Production board workflows;
+- Invoices and manual payment-status tracking;
+- simple internal expense tracking with private receipt attachments;
+- owner/admin sales-tax tracking from issued invoice snapshots;
+- server-generated Quote and Invoice PDFs;
+- integer-cent money storage and decimal-safe quantity handling;
+- Dashboard and in-app attention reminders;
+- full Calendar and shared scheduling foundations;
+- departments, assignees, resources, conflicts, and linked scheduling records;
+- commercial bundles;
+- secure Order attachments;
+- encrypted manual backup and empty-tenant restore;
+- SendGrid-backed customer email and delivery tracking;
+- Customer communication history;
+- Incoming Requests for deliberately forwarded order email, with conversion/linking to Orders;
+- device-camera photo capture inside the Order Workspace;
+- non-destructive photo annotation saved as attachment derivatives;
+- Employee administration linked to existing tenant users;
+- Employee Time Clock and My Pay portal routes;
+- manager Time & Attendance review, correction, void, and missing-entry workflows;
+- Saturday-Friday internal weekly pay tracking with Friday payday;
+- advances, adjustments, manual payments, carryover, close, and reopen;
+- owner/admin Employee Announcement management;
+- Employee Portal announcement read/unread tracking;
+- basic one-to-one tenant-isolated Internal Employee Messages;
+- a basic arithmetic calculator;
+- GitHub Actions CI for migrations, tests, exclusion guards, and production builds.
+
+Messages and Announcements remain separate from Customer communication history and Incoming Requests.
+
+Commercial Release B adds controlled hosted onboarding and account recovery:
+
+- production registration is invite-only unless `SIGNGUY_SLIM_PUBLIC_REGISTRATION_ENABLED=1`;
+- owner/admin users can create single-use signup invitations and same-tenant password reset links;
+- public reset requests return a generic response to avoid account enumeration;
+- login, registration, reset, invitation, operator-recovery, upload, customer-email, and backup operations have application-level rate budgets;
+- tenant storage usage is derived from private attachment records, and upload/annotation/intake/portable-restore paths check quota before committing durable bytes.
+
+Commercial Release C narrows the commercial authorization boundary:
+
+- owner/admin/manager remain the commercial operators for Customers, Quotes, Orders, Incoming Requests, customer communications, Invoices, Payments, and shared commercial scheduling;
+- staff no longer receive broad commercial write authority by virtue of being an authenticated staff user;
+- staff can still perform assigned operational production execution, production evidence attachment/photo/annotation work, constrained personal calendar entries, and Employee Portal workflows;
+- frontend navigation and workspace controls use backend-derived capability flags, but backend service methods remain authoritative.
+
+Commercial Release D adds the initial operations boundary:
+
+- `GET /api/health` reports process liveness without authentication, tenant data, filesystem paths, or secrets;
+- `GET /api/ready` performs bounded readiness checks for database reachability, migrations, production configuration, and incomplete restore markers;
+- every HTTP response includes `X-Request-Id`, and safe structured logs include request/error correlation;
+- unexpected production errors return stable safe JSON with request/error IDs while stack traces stay server-side;
+- `npm run backend:diagnostics` reports safe operator diagnostics without credentials, cookies, tokens, passphrases, customer files, or message bodies;
+- CI includes dependency-audit and operations-smoke gates.
+
+## Commands
+
+```powershell
+npm ci
+npm run backend:migrate
+npm run backend:dev
+npm run backend:config:production
+npm run backend:migrate:production
+npm run backend:backup:server
+npm run backend:backup:database
+npm run backend:backup:attachments
+npm run backend:restore:server -- --input C:\path\to\backup-set --confirm RESTORE_SERVER_BACKUP
+npm run backend:restore:database -- --input C:\path\to\backup-set --confirm RESTORE_DATABASE
+npm run backend:restore:attachments -- --input C:\path\to\backup-set --confirm RESTORE_ATTACHMENTS
+npm run backend:diagnostics
+npm run backend:operations-smoke
+npm run test
+npm run lint
+npm run guard
+npm run build
+```
+
+For final change validation also run:
+
+```powershell
+git diff --check
+```
+
+`package.json` is the application-version source of truth. Backup provenance reads the npm package version when the backend is launched through npm scripts, with the same current version retained as the direct-node fallback.
+
+## Core Architecture Rules
+
+The following rules are intentional and should be preserved unless a later architecture decision explicitly replaces them:
+
+- Slim remains independent from the full `SIGNGUY-MVP` runtime and production data stores.
+- Business records are tenant-scoped and same-tenant relationships are enforced in services and, where practical, database constraints/triggers.
+- Stable portable IDs are retained for backup, restore, and future Slim-to-full-product portability.
+- Orders contain first-class Order Items. Production structures must not collapse Order Items into one undifferentiated Order description.
+- Work Orders own operational production stage and completion after Order Items are released to production. Order Item production fields are constrained compatibility snapshots derived from active Work Orders.
+- Calendar records remain separate from Order due dates, Order Item due dates, and production completion state.
+- Completing a Calendar Event must not silently complete production, and completing production must not silently complete Calendar Events.
+- Historical commercial and pay values must preserve authoritative snapshots where the current contracts require them.
+- Attachments remain private, authenticated, tenant-scoped records. The frontend must not receive raw filesystem paths or unauthenticated storage URLs.
+- Customer portable backup/restore remains a portability boundary rather than a mechanism for sharing Slim and MVP live databases. Server backups are separate hosted disaster-recovery artifacts. Step 3A customer backups use `signguy-slim-backup-v2` / portable contract `1.1.0-step3-expenses-sales-tax` while retaining restore support for legacy v1 packages.
+- Release B runtime controls are not customer-portable business data: rate-limit buckets, signup invitations, password-reset tokens, active sessions, CSRF state, and hosted quota policy are excluded from portable exports.
+- Hosted tenant quota policy is deployment-operator controlled; tenant users can view quota/usage but cannot raise their own hard storage limit through Slim.
+- Commercial write access is owner/admin/manager. Staff-facing production and Employee Portal surfaces must not be treated as permission to mutate customer, Quote, Order, Invoice, Payment, customer-email, settings, backup, invitation, recovery, or quota-policy records.
+- Customer communication history and internal employee messaging must remain separate domains even if they reuse common infrastructure patterns.
+- Browser authentication uses server-managed opaque sessions carried only in the `signguy_slim_session` HttpOnly cookie. Frontend JavaScript may hold the non-secret `csrf_token` from `/api/auth/me` in memory for unsafe requests, but must not persist bearer session secrets in browser-readable storage.
+- Production deployments must use explicit durable absolute paths for `SIGNGUY_SLIM_DB_PATH`, `SIGNGUY_SLIM_ATTACHMENT_ROOT`, and `SIGNGUY_SLIM_SERVER_BACKUP_ROOT`. Repository-local defaults are development-only.
+
+See:
+
+- `docs/SLIM_ARCHITECTURE_BOUNDARY.md`
+- `docs/SLIM_TECHNICAL_DEBT_REGISTER.md`
+- `docs/COMMERCIAL_RELEASE_READINESS_AUDIT.md`
+- `docs/RELEASE_A_DATA_DURABILITY.md`
+- `docs/SERVER_BACKUP_AND_RECOVERY.md`
+- `docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md`
+- `docs/ACCOUNT_RECOVERY_AND_ONBOARDING.md`
+- `docs/RELEASE_D_COMMERCIAL_OPERATIONS.md`
+- `docs/SUPPORT_AND_INCIDENT_RESPONSE.md`
+- `docs/COMMERCIAL_RELEASE_CHECKLIST.md`
+- `docs/COMMERCIAL_LAUNCH_BUSINESS_CHECKLIST.md`
+- `docs/V2_STAGE1_2_REUSE_MAP.md`
+- `docs/V2_STAGE3_4_REUSE_MAP.md`
+- `docs/V2_STAGE5_6_REUSE_MAP.md`
+- `docs/V2_STAGE7_8_REUSE_MAP.md`
+- `docs/SIGNGUY_SLIM_VERSION_2_MASTER_BUILD_PLAN.md`
+
+## Money And Pay Rules
+
+Slim stores money as integer cents and quantities as decimal strings where required. Commercial documents preserve tax and financial snapshots instead of recalculating historical records from current shop settings.
+
+Employee pay tracking is an internal weekly ledger/estimate, not a payroll-processing or accounting system. Current pay weeks run Saturday through Friday with Friday payday. The implemented Stage 6 model tracks rate snapshots, opening carryover, gross pay, advances, positive/negative adjustments, manual payments, estimated amount due, close snapshots, and reopen history.
+
+Employee self-service punch timestamps are server-authoritative. Historical time correction is an authorized manager/admin workflow with audit requirements. Pay-week calculations allocate overlapping time to the appropriate pay-week interval, closed-week protections prevent ordinary mutation, and out-of-order close/reopen behavior is guarded to preserve downstream carryover integrity.
+
+Slim does not currently provide payroll tax calculation, withholding, overtime rules, direct deposit, tax filing, benefits, or payroll-provider integration.
+
+## Orders, Order Items, Work Orders, And Production
+
+Orders and Order Items remain the commercial source records. Work Orders are operational production records linked back to their source Order Items.
+
+Order Items own the commercial/product object being made: title/description, quantity, pricing snapshot, customer-facing identity, production-required flag, due date, and assignment. Before release to production, a production-required Order Item with no active Work Order derives `not_started`; a non-production item is excluded from production progress.
+
+After release to production, the active Work Order owns operational production stage and completion. Order Item production fields remain as constrained compatibility snapshots and must not be directly edited as independent truth. Production board, Order Workspace, and Home dashboard summaries derive production progress from production-required Order Items and their active Work Orders.
+
+Cancelled and superseded Work Orders remain historical records and do not drive current production progress. One active Work Order item assignment may control an Order Item at a time. Reopening a completed active Work Order immediately changes the derived Order Item and Order production state while preserving audit history.
+
+Order completion, production completion, and Calendar completion remain separate concepts.
+
+## Communications And Incoming Requests
+
+Version 2 Stages 1-2 added SendGrid-backed customer email, delivery-state tracking, Customer communication history, and focused Email Order Intake. The current navigation presents the Stage 2 queue as **Incoming Requests** inside Orders.
+
+Incoming Requests uses a private tenant-specific intake route for deliberately forwarded order-related emails. It does not synchronize Gmail, Outlook, Microsoft 365, or a complete mailbox, and it does not automatically create confirmed Orders.
+
+Stage 9 may later extend this same Intake model to an authorized Facebook business Page. That stage is currently deferred and must not be scaffolded during Stages 7-8.
+
+## Camera And Annotation
+
+Version 2 Stages 3-4 reuse the private Order attachment pipeline for device-camera capture and non-destructive image annotation.
+
+Original image bytes are never overwritten. Confirmed annotations are stored as separate derivative attachments linked to the original and audited through the existing attachment model.
+
+## Employee Time And Weekly Pay
+
+Version 2 Stages 5-6 added Employee administration, Time Clock, My Pay, manager Time & Attendance review, and internal weekly pay summaries.
+
+Employee records are tenant-scoped and linked to existing same-tenant users. Employee administration is owner/admin controlled. Sensitive pay information requires owner access or explicit pay-management permission. Managers without pay permission may review/correct time but do not receive payroll/pay-rate access.
+
+Employees may access only their own Time Clock and My Pay data through the restricted Employee Portal.
+
+## Employee Announcements And Internal Messages
+
+### Employee Announcements
+
+Version 2 Stage 7 adds:
+
+- owner/admin announcement creation and management;
+- title and safe body content;
+- publish/start date and optional expiration;
+- simple all-active-Employee or supported role-group targeting;
+- archive/edit audit history;
+- Employee Portal current-announcement view;
+- per-Employee read/unread state.
+
+### Internal Employee Messages
+
+Version 2 Stage 8 adds:
+
+- basic one-to-one tenant-isolated internal direct messages;
+- simple conversation threads;
+- sender, recipient, sent time, and message body;
+- unread count/read state;
+- active-user and tenant validation;
+- immutable ordinary sent messages.
+
+Combined Stages 7-8 explicitly exclude group chat, channels, message attachments, reactions, typing indicators, presence, voice, video, social-feed behavior, and customer-communication merging.
+
+Messages and Announcements must reuse the existing Employee Portal and employee/user identity. Do not create a second staff portal or parallel identity model.
+
+Backup/restore includes the Stage 7-8 records and relationships. Provider credentials and secrets remain excluded.
+
+## Deferred Stage 9: Facebook Page Order Intake
+
+Stage 9 remains part of the longer-term Version 2 scope but is intentionally postponed.
+
+When separately authorized later, it may connect an authorized Facebook business Page through supported Meta APIs/webhooks and allow a user to deliberately send an eligible Page conversation into the existing Stage 2 Incoming Requests queue.
+
+It must not access personal-profile Messenger inboxes, automatically create Orders, or expand into Instagram, WhatsApp, SMS, or a general social-media CRM.
+
+## Scope Exclusions
+
+Unless separately authorized in a later documented stage, Slim does not include:
+
+- direct shared Slim/MVP databases, sessions, storage, or production secrets;
+- Pricing Engine integration;
+- Stripe or customer payment processing;
+- Webstores;
+- inventory/supply purchasing;
+- full accounting/reporting;
+- payroll-provider integration, payroll taxes, withholding, direct deposit, tax filing, or benefits;
+- AI features;
+- Customer Portal/Decision Room;
+- SMS/MMS;
+- global Asset/Document Library or DocuLink;
+- general-purpose design/image editor;
+- production time tracking/station checkout/machine time;
+- full-mailbox Gmail/Outlook synchronization;
+- Stage 9 Meta/Facebook code until separately authorized;
+- automatic confirmed Order creation from inbound communications;
+- group chat/channels/attachments/reactions/voice/video internal messaging.
+
+Do not expose deferred or excluded modules as disabled `coming soon` UI.
+
+## Technical Debt And Future Corrections
+
+Known architecture, maintainability, terminology, navigation, and security-hardening issues are tracked in:
+
+`docs/SLIM_TECHNICAL_DEBT_REGISTER.md`
+
+Preservation notes after Groups C-F include:
+
+1. preserve the Group E domain/page extraction boundaries rather than re-adding business logic to `backend/src/services.js` or `src/App.jsx`;
+2. preserve the employee time/pay source-row versus closed-week snapshot boundary before any future external payroll/accounting expansion;
+3. keep employee communications separate from customer communications and Order Intake during future decomposition;
+4. keep browser authentication on HttpOnly cookie sessions with CSRF-protected unsafe requests before commercial hosting.
+
+Group C resolved the production source-of-truth hardening concern in a bounded production pass. Group D extracted Employee, Time, Pay, Announcements, Messages, and Employee Portal code into focused modules. Group E extracted the remaining general backend service domains and moved the remaining page/workspace bodies out of the application shell while preserving the existing route/API behavior. Group F hardens browser session transport by replacing `localStorage` bearer-token authentication with HttpOnly cookie sessions and CSRF validation for authenticated state-changing requests.
+
+## Authentication Transport
+
+Slim uses server-side opaque sessions stored as hashed tokens in the database. Login and registration set the `signguy_slim_session` cookie locally and the `__Host-signguy_slim_session` cookie in secure contexts, with `HttpOnly`, `Path=/`, `SameSite=Lax`, and an expiry/max-age tied to the server-side session lifetime. Production, explicit `SIGNGUY_SLIM_COOKIE_SECURE=1`, and direct HTTPS requests set `Secure`. Reverse-proxy HTTPS headers are trusted only when `SIGNGUY_SLIM_TRUST_PROXY=1`; local HTTP development keeps `Secure` off so the Vite/API development flow continues to work.
+
+Frontend startup does not read a browser-stored bearer token. It calls `/api/auth/me` with `credentials: "include"` and stores only the returned user, tenant, capabilities, and `csrf_token` in memory. Authenticated `POST`, `PUT`, `PATCH`, and `DELETE` browser requests send `X-CSRF-Token`; `GET` requests remain CSRF-free but still require the session cookie when the endpoint is protected.
+
+Login and registration reject cross-site cookie-issuance attempts using Origin/Fetch Metadata checks before setting a session cookie. Logout uses the same origin gate before clearing an unauthenticated cookie, and GET routes that mark Employee Portal announcements/messages as read reject cross-site navigation attempts. API responses are marked `Cache-Control: no-store, private` and `Vary: Cookie` so cookie-authenticated tenant data is not reusable by shared caches.
+
+Commercial hosting must run behind HTTPS and must not add wildcard credentialed CORS. If the API is deployed behind a TLS-terminating reverse proxy, enable forwarded-proto trust only for that known proxy path. If frontend and backend are split across origins later, configure `SIGNGUY_SLIM_ALLOWED_ORIGINS` with explicit trusted origins before enabling credentialed cross-origin requests.
+
+## CI
+
+GitHub Actions runs the Slim migration check, test suite, lint/static analysis, source/dependency exclusion guard, and production build on pull requests and pushes to `main`.
+
+The user-owned untracked `artifacts/` folder is not application source and must remain untouched unless the user explicitly authorizes otherwise.

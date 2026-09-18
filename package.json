@@ -1,0 +1,52 @@
+{
+  "name": "signguy-slim",
+  "private": true,
+  "version": "0.2.0-v2-stage8",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "backend:dev": "node backend/src/server.js",
+    "backend:migrate": "node backend/src/migrate.js",
+    "backend:config:production": "node backend/src/server-backup-cli.js validate-production-config",
+    "backend:backup:database": "node backend/src/server-backup-cli.js backup-database",
+    "backend:backup:attachments": "node backend/src/server-backup-cli.js backup-attachments",
+    "backend:backup:server": "node backend/src/server-backup-cli.js backup-server",
+    "backend:restore:database": "node backend/src/server-backup-cli.js restore-database",
+    "backend:restore:attachments": "node backend/src/server-backup-cli.js restore-attachments",
+    "backend:restore:server": "node backend/src/server-backup-cli.js restore-server",
+    "backend:migrate:production": "node backend/src/server-backup-cli.js migrate-production",
+    "backend:diagnostics": "node backend/src/operations.js",
+    "backend:operations-smoke": "node backend/src/operations-smoke.js",
+    "backend:account:create-bootstrap-invitation": "node backend/src/account-controls-cli.js create-bootstrap-invitation",
+    "backend:account:create-operator-password-reset": "node backend/src/account-controls-cli.js create-operator-password-reset",
+    "backend:account:revoke-bootstrap-invitations": "node backend/src/account-controls-cli.js revoke-bootstrap-invitations",
+    "build": "vite build",
+    "guard": "node tools/check-exclusions.mjs",
+    "lint": "eslint \"src/**/*.{js,jsx}\" \"backend/src/**/*.js\" \"tools/**/*.mjs\"",
+    "test": "vitest run --no-file-parallelism"
+  },
+  "engines": {
+    "node": "24.16.0",
+    "npm": "11.13.0"
+  },
+  "dependencies": {
+    "bcryptjs": "3.0.3",
+    "busboy": "1.6.0",
+    "lucide-react": "1.33.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.2",
+    "@vitejs/plugin-react": "6.1.0",
+    "eslint": "10.9.1",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.11.0",
+    "jsdom": "30.0.1",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
+  }
+}

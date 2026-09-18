@@ -1,0 +1,55 @@
+name: Slim CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  slim:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.16.0"
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Provision production config check paths
+        run: |
+          mkdir -p /tmp/signguy-slim-ci/db
+          mkdir -p /tmp/signguy-slim-ci/attachments
+          mkdir -p /tmp/signguy-slim-ci/server-backups
+          chmod 700 /tmp/signguy-slim-ci/db
+          chmod 700 /tmp/signguy-slim-ci/attachments
+          chmod 700 /tmp/signguy-slim-ci/server-backups
+      - name: Production config check
+        env:
+          NODE_ENV: production
+          SIGNGUY_SLIM_DB_PATH: /tmp/signguy-slim-ci/db/signguy-slim.sqlite
+          SIGNGUY_SLIM_ATTACHMENT_ROOT: /tmp/signguy-slim-ci/attachments
+          SIGNGUY_SLIM_SERVER_BACKUP_ROOT: /tmp/signguy-slim-ci/server-backups
+          SIGNGUY_SLIM_APP_URL: https://slim-ci.example.test
+          SIGNGUY_SLIM_RECOVERY_FROM_EMAIL: recovery@slim-ci.example.test
+          SIGNGUY_SLIM_COOKIE_SECURE: "1"
+        run: npm run backend:config:production
+      - name: Backend migration check
+        run: npm run backend:migrate
+      - name: Operations smoke
+        run: npm run backend:operations-smoke
+      - name: Test
+        run: npm run test
+      - name: Lint
+        run: npm run lint
+      - name: Guard
+        run: npm run guard
+      - name: Build
+        run: npm run build
+      - name: Dependency audit
+        run: npm audit --json
+      - name: Production dependency audit
+        run: npm audit --omit=dev --json
